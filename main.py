@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 logger = logging.getLogger("ai_backend")
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.4")
 
 # 建议通过环境变量配置你的网关地址
 # 例如：https://api.example.com
