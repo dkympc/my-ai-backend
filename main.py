@@ -1201,7 +1201,7 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
         if user_content: messages_to_send.append({"role": "user", "content": user_content})
 
         upstream_payload = {
-            "model": "gemini-3.1-pro-preview",
+            "model": "gemini-3.5-flash",
             "messages": messages_to_send,
             "stream": True,
             "temperature": 0.95,
