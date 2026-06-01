@@ -1242,7 +1242,7 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
                     if not upstream_response.is_closed: await upstream_response.aclose()
 
             resp_headers = _safe_headers(upstream_response.headers)
-            resp_headers.update({"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+            resp_headers.update({"Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
             return StreamingResponse(stream_generator(), status_code=upstream_response.status_code, headers=resp_headers)
 
         except Exception as e: return _generic_error(f"Workflow Engine Error: {str(e)}", 500)
