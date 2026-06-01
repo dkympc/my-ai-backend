@@ -751,7 +751,7 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
                 f"{NEW_API_BASE_URL}/v1/images/generations",
                 headers=_build_upstream_headers(actual_api_key, False),
                 json=safe_payload,
-                timeout=60.0  
+                timeout=300.0  
             )
             content = upstream_response.content 
             last_response, last_content = upstream_response, content
