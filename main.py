@@ -46,7 +46,7 @@ def calculate_video_cost(model: str, resolution: str, has_video_input: bool, has
     return int(cost_rmb * RMB_TO_TOKEN)
 import asyncio
 import json
-import logging
+import logging         
 import os
 import re
 import traceback
@@ -633,7 +633,12 @@ async def chat_completions(request: Request, user_info: dict = Depends(verify_to
                 finally:
                     if not upstream_response.is_closed: await upstream_response.aclose()
             resp_headers = _safe_headers(upstream_response.headers)
-            resp_headers.update({"Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive"})
+            resp_headers.update({
+                "Content-Type": "text/event-stream", 
+                "Cache-Control": "no-cache, no-transform", 
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # ✨ 核心魔法：强制关闭 Nginx 缓存，解决部署后的流式卡顿
+            })
             return StreamingResponse(stream_generator(), status_code=upstream_response.status_code, headers=resp_headers)
 
         content = await upstream_response.aread()
@@ -1241,8 +1246,12 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
                 finally:
                     if not upstream_response.is_closed: await upstream_response.aclose()
 
-            resp_headers = _safe_headers(upstream_response.headers)
-            resp_headers.update({"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
+            resp_headers.update({
+                "Content-Type": "text/event-stream", 
+                "Cache-Control": "no-cache, no-transform", 
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # ✨ 核心魔法：强制关闭 Nginx 缓存，解决部署后的流式卡顿
+            })
             return StreamingResponse(stream_generator(), status_code=upstream_response.status_code, headers=resp_headers)
 
         except Exception as e: return _generic_error(f"Workflow Engine Error: {str(e)}", 500)
