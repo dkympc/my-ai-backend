@@ -66,6 +66,9 @@ from dotenv import load_dotenv
 import base64
 import uuid
 import aiofiles
+import zipfile
+import xml.etree.ElementTree as ET
+import io
 from fastapi.staticfiles import StaticFiles
 
 # --- 自动加载本地 .env 文件 ---
@@ -275,7 +278,7 @@ NEW_API_KEY = os.getenv("NEW_API_KEY", "").split("#")[0].strip()
 DMX_API_BASE_URL = os.getenv("DMX_API_BASE_URL", "https://www.dmxapi.cn").split("#")[0].strip().rstrip("/")
 DMX_API_KEY = os.getenv("DMX_API_KEY", "").split("#")[0].strip()
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.4").split("#")[0].strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.5-flash").split("#")[0].strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
 ALLOWED_MODELS = [
@@ -462,26 +465,107 @@ async def admin_user_action(username: str, request: Request):
 
 @app.post("/v1/user/sync_sessions", dependencies=[Depends(verify_token)])
 async def sync_user_sessions(request: Request, user_info: dict = Depends(verify_token)):
-    """接收前端发来的同步请求，将完整多模态记录落盘到 SQLite"""
+    """接收前端发来的同步请求，将完整多模态记录落盘到 SQLite (智能合并防覆盖版)"""
     try:
-        data = await request.json()
+        raw_body = await request.body()
+        incoming_json = raw_body.decode('utf-8')
+        incoming_data = json.loads(incoming_json)
     except Exception:
         return _generic_error("Invalid JSON", 400)
         
     username = user_info["username"]
-    sessions_json = json.dumps(data, ensure_ascii=False)
-    
     conn = get_db_connection()
-    # SQLite 特有的 Upsert 语法 (插入或更新)
+    
+    # ✨ 核心修复：取出老数据，进行基于 ID 的深度合并（彻底解决多页签互相覆盖的问题）
+    existing_row = conn.execute("SELECT sessions_data FROM user_sessions WHERE username=?", (username,)).fetchone()
+    
+    if existing_row and existing_row["sessions_data"]:
+        try:
+            existing_data = json.loads(existing_row["sessions_data"])
+            
+            def merge_arrays(old_arr, new_arr):
+                if not isinstance(old_arr, list) or not isinstance(new_arr, list): return new_arr
+                # 以 ID 为主键建立字典，新数据覆盖老数据，老数据不丢失
+                merged_dict = {item.get("id"): item for item in old_arr if isinstance(item, dict) and "id" in item}
+                for item in new_arr:
+                    if isinstance(item, dict) and "id" in item:
+                        merged_dict[item["id"]] = item
+                # 将合并后的字典转回列表，按时间倒序排序
+                merged_list = list(merged_dict.values())
+                try: merged_list.sort(key=lambda x: x.get("updatedAt", x.get("timestamp", 0)), reverse=True)
+                except Exception: pass
+                return merged_list
+            
+            # 分别合并四大核心记录数组
+            incoming_data["sessions"] = merge_arrays(existing_data.get("sessions", []), incoming_data.get("sessions", []))
+            incoming_data["imageHistory"] = merge_arrays(existing_data.get("imageHistory", []), incoming_data.get("imageHistory", []))
+            incoming_data["videoHistory"] = merge_arrays(existing_data.get("videoHistory", []), incoming_data.get("videoHistory", []))
+            incoming_data["wfSessions"] = merge_arrays(existing_data.get("wfSessions", []), incoming_data.get("wfSessions", []))
+            
+            # Settings 字段直接更新覆盖
+            old_settings = existing_data.get("settings", {})
+            old_settings.update(incoming_data.get("settings", {}))
+            incoming_data["settings"] = old_settings
+            
+            incoming_json = json.dumps(incoming_data, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"合并JSON失败: {e}")
+            pass # 如果合并失败，退回使用新数据兜底
+
     conn.execute("""
         INSERT INTO user_sessions (username, sessions_data) 
         VALUES (?, ?)
         ON CONFLICT(username) DO UPDATE SET sessions_data=excluded.sessions_data
-    """, (username, sessions_json))
+    """, (username, incoming_json))
     conn.commit()
     conn.close()
     
-    return JSONResponse(content={"message": "数据已同步至数据库"})
+    return JSONResponse(content={"message": "数据已同步"})
+
+# 👆 确保上面那个函数的 return 已经正常结束，并且上面的代码没有留着未闭合的缩进
+
+# 👇 注意：这两行前面必须【完全顶格】，绝对不能有空格！
+@app.post("/v1/utils/parse_doc", dependencies=[Depends(verify_token)])
+async def parse_document(request: Request):
+    """黑科技：零依赖的 Word 文档智能提取器"""
+    try:
+        data = await request.json()
+        filename = data.get("filename", "").lower()
+        b64_data = data.get("b64_data", "")
+        
+        if not b64_data or not filename.endswith(".docx"):
+            return _generic_error("目前仅支持解析 .docx 格式", 400)
+            
+        # 去除前端 Base64 的头部说明
+        if "," in b64_data:
+            b64_data = b64_data.split(",", 1)[1]
+            
+        file_bytes = base64.b64decode(b64_data)
+        extracted_text = ""
+        
+        # .docx 本质上是包含 XML 的 ZIP 压缩包，我们直接在内存中解压它
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            xml_content = zf.read("word/document.xml")
+        
+        tree = ET.fromstring(xml_content)
+        namespaces = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        
+        # 遍历 XML，按段落提取文字，完美保留原文档的换行结构
+        for paragraph in tree.findall('.//w:p', namespaces):
+            para_texts = paragraph.findall('.//w:t', namespaces)
+            para_str = "".join([t.text for t in para_texts if t.text])
+            if para_str:
+                extracted_text += para_str + "\n"
+                
+        if not extracted_text.strip():
+            return _generic_error("未能从文档中提取到有效文字", 400)
+            
+        # 限制字数，保护大模型上下文窗口不被撑爆 (截断前 60000 字)
+        return JSONResponse(content={"text": extracted_text[:60000]})
+        
+    except Exception as e:
+        logger.error(f"文档解析失败: {e}")
+        return _generic_error("解析失败，文件可能已损坏或带有密码保护", 500)
 
 # ==============================
 # ✨ 新增：前端初始化时拉取云端数据
