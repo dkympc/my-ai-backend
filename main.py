@@ -123,6 +123,9 @@ def init_db():
     except sqlite3.OperationalError: pass
     try: cursor.execute("ALTER TABLE users ADD COLUMN allow_workflow INTEGER DEFAULT -1")
     except sqlite3.OperationalError: pass
+        # ✨ 新增：心跳时间戳字段，无损迁移
+    try: cursor.execute("ALTER TABLE users ADD COLUMN last_active_at INTEGER DEFAULT 0")
+    except sqlite3.OperationalError: pass
 
     # ✨ 执行无损数据修正：给老数据赋予正确的默认权限（tester默认禁图文，其他人全开）
     cursor.execute("UPDATE users SET allow_chat=0 WHERE allow_chat=-1 AND role='tester'")
@@ -382,7 +385,7 @@ async def login(request: Request):
         
         # 更新数据库中的登录状态和时间
         now_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
-        conn.execute("UPDATE users SET online=1, last_login=? WHERE username=?", (now_str, username))
+        conn.execute("UPDATE users SET online=1, last_login=?, last_active_at=? WHERE username=?", (now_str, now_ts, username))
         conn.commit()
         conn.close()
         
@@ -400,14 +403,26 @@ async def login(request: Request):
 
 @app.post("/v1/logout", dependencies=[Depends(verify_token)])
 async def logout(user_info: dict = Depends(verify_token)):
-    """用户退出登录时触发下线"""
     username = user_info["username"]
     conn = get_db_connection()
-    conn.execute("UPDATE users SET online=0 WHERE username=?", (username,))
+    # 注销时时间戳清零
+    conn.execute("UPDATE users SET online=0, last_active_at=0 WHERE username=?", (username,))
     conn.commit()
     conn.close()
     return JSONResponse(content={"message": "已注销"})
 
+@app.post("/v1/user/heartbeat", dependencies=[Depends(verify_token)])
+async def user_heartbeat(user_info: dict = Depends(verify_token)):
+    """接收前端心跳，更新最后活跃时间"""
+    username = user_info["username"]
+    now_ts = int(datetime.utcnow().timestamp())
+    
+    conn = get_db_connection()
+    # 仅更新时间戳，操作极快
+    conn.execute("UPDATE users SET last_active_at=? WHERE username=?", (now_ts, username))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "alive"})
 
 # ==============================
 @app.get("/v1/admin/users", dependencies=[Depends(verify_admin)])
@@ -418,11 +433,17 @@ async def get_admin_users():
     conn.close()
     
     users_data = []
+    now_ts = int(datetime.utcnow().timestamp()) # 获取当前时间
+    
     for u in users:
+        # ✨ 动态心跳计算：当前时间 - 最后活跃时间 < 60秒，且未被管理员强制下线，才算真在线
+        last_active = u["last_active_at"] if "last_active_at" in u.keys() and u["last_active_at"] else 0
+        is_really_online = bool(u["online"] and (now_ts - last_active < 60))
+        
         users_data.append({
             "username": u["username"],
             "role": u["role"],
-            "online": bool(u["online"]),
+            "online": is_really_online,  # 👈 抛弃死的数据库字段，使用动态算出的状态
             "tokens_used": u["tokens_used"],
             "token_balance": u["token_balance"],
             "last_login": u["last_login"],
@@ -432,7 +453,6 @@ async def get_admin_users():
             "allow_workflow": bool(u["allow_workflow"])
         })
     return JSONResponse(content={"data": users_data})
-
 @app.post("/v1/admin/users/{username}/action", dependencies=[Depends(verify_admin)])
 async def admin_user_action(username: str, request: Request):
     """管理员操作 (充值 / 踢下线 / 切换权限)"""
@@ -450,8 +470,9 @@ async def admin_user_action(username: str, request: Request):
         conn.execute("UPDATE users SET token_balance = token_balance + ? WHERE username=?", (amount, username))
     elif action == "reset_tokens": 
         conn.execute("UPDATE users SET tokens_used=0 WHERE username=?", (username,))
+# 找到 elif action == "kick": 这一行
     elif action == "kick": 
-        conn.execute("UPDATE users SET online=0 WHERE username=?", (username,))
+        conn.execute("UPDATE users SET online=0, last_active_at=0 WHERE username=?", (username,))
     elif action == "update_permission":
         # ✨ 新增：处理前端传来的权限切换请求
         perm_type = data.get("perm_type")
@@ -1079,14 +1100,36 @@ WORKFLOW_PROMPTS = {
 1. **触发条件：** 用户在第二步中回复了“确认参数/开始/通过”等许可指令，并发送了具体的“剧本片段”（如 300-400 字）时触发。
 2. **AI 动作：** 
    - 接收剧本片段，开始进行具体的分镜提示词输出。
-   - **景别参考规则：** 优先识别并参考文学剧本中已有的景别标记（如 `[特写]`、`[中景]`、`[全景]`、`[空镜头]`），作为基础参考并根据 AI 视频模型特性进行灵活切镜，**每个分镜时长严格控制在 4-15s 之间**。
-   - **对白语速与分镜拆分铁律（公式计算）**：中文字数 ÷ 3.5 = 对应台词所需的【最低安全时长（秒）】。如果一段台词通过公式计算出来的安全时长**超过 15 秒**，严禁塞入单个分镜！你必须主动将其拆分为两个或多个连续镜号（如镜号2A，镜号2B，或者插入反应镜、空镜头来交替消化对白）。
-   - **长台词单镜内多景别切分**：在单个 8-15 秒的分镜内，如果对白时间超过 5 秒（字数超过 15 字），**必须在中间时序进行至少一次景别硬切**（例如：前半段台词用中景镜头，中间时序通过“硬切”切换到特写镜头）。
-   - **物理视觉化描述铁律（去文学化与微表情优化）：** 
-     - **禁止文学形容词**：严禁在【首帧为】和【画面主体】中使用抽象的文学化修辞（如“深邃冷漠”、“空气中弥漫着绝望”）。你必须将这些调性完全翻译为**具体的物理视觉指令**（如：明确光源颜色与角度、高光/阴影关系、雨水/金属等材质纹理、焦距与景深变化）。
-     - **人物情绪物理化**：人物情绪表达拒绝夸张。避免“极其痛苦”、“愤怒至极”等导致模型脸部变形的词汇。必须优化为**具体的微表情或身体物理动作**（如：“眉头微微皱起/furrowed brow”、“视线向下游离/eyes casting downward”、“手指在桌面悬停/finger hovering above the desk”）。抽象的情绪修辞只允许留在“音效与台词设计”中的括号提示内。
-   - **长镜头/硬切判定：** 若分镜内部包含“硬切”、“黑屏”或转场，**严禁**在镜号中声明其为“连续长镜头（continuous shot / single take）”。
-   - **格式要求：** 严格按照下方指定的【输出固定格式】进行渲染，每个分镜中必须完整附带【全局约束】模块。
+   
+   - **景别参考规则：** 优先识别并参考文学剧本中已有的景别标记（如 `[特写]`、`[中景]`、`[全景]`、`[空镜头]`），作为基准景别，并结合 AI 视频模型特性灵活切镜。**每个分镜的时长严格控制在 4-15 秒之间**。
+
+   - **对白语速与分镜拆分铁律（强制公式计算）：**  
+     中文字数 ÷ 3.5 = 对应台词所需的【最低安全时长（秒）】。在输出每一个分镜前，**你必须先行完成该计算**。  
+     - 若一段台词的所需安全时长 **超过 15 秒**，严禁塞入单个分镜。必须主动将其拆分为两个或多个独立镜号（如镜号 2A、镜号 2B，或插入反应镜、空镜头来交替消化对白）。
+
+   - **长台词单镜内多景别切分（强制时序拆解）：**  
+     只要单个分镜时长 **≥ 8 秒**，或该镜内对白字数 **> 15 字**，严禁在画面主体中只描述一个时间段的完整状态。你必须将其物理拆分为至少两个时序段（如 0-5s 和 6-10s），并分别赋予不同的景别或构图变化。  
+     - **切换方式不再局限于“硬切”**（原 MD 的硬性硬切要求已升级）。在时序过渡时，更优先鼓励使用连续长镜头内的**动态演进**，例如：动作连贯延展、平滑推拉跟摇、焦点转换（Rack Focus）等。仅当动态演进无法满足叙事需求时，才允许使用硬切或其它转场方式。
+
+   - **物理视觉化描述铁律（去文学化与微表情优化）：**  
+     - **禁止文学形容词**：严禁在【首帧为】和【画面主体】中使用抽象的文学化修辞（如“深邃冷漠”、“绝望的氛围”）。必须将这些感受完全翻译为**具体的物理视觉指令**：明确光源的颜色与角度、高光/阴影关系、雨水/金属等材质纹理、焦距与景深变化、肌肉牵扯、物理位移、衣服褶皱变化及道具的物理交互方式。  
+     - **人物情绪物理化**：所有情绪必须转化为**可被镜头直接捕捉的微表情或微动作**（如：“眉头微皱 / furrowed brow”、“视线向下游离 / eyes casting downward”、“手指在桌面悬停 / finger hovering above the desk”）。严禁使用“极其痛苦”、“愤怒至极”等易导致模型脸部变形的夸张词汇。抽象的情绪提示只允许保留在“音效与台词设计”的括号注释内。
+
+   - **人物空间站位与“时序状态锚定”铁律（防姿态突变）：**  
+     在每一个时间分段（timeSegments）的描述内，只要提及人物动作，**必须先于姓名之前强行附加当前该人物的姿态/站位状态的修辞锚定词**。  
+     *示例：* 必须写成“坐在工作台后的 @老匠人 缓缓落下镊子”，而非直接写“@老匠人 缓缓落下镊子”。此规则确保每一时序中的人物状态被准确锚定，杜绝前后姿态突变。
+
+   - **空间轴线锚定铁律（防跳轴）：**  
+     在双人、多人对话或同场景连续分镜中，**强制锁定左右站位关系**。角色 A 永远留在画面左区，角色 B 永远留在画面右区。**绝对不允许越轴**，除非中间插入明确越过轴线的过渡镜头（如中性空镜、第三视角游移镜头）。
+
+   - **双人/多人 Z 轴定位铁律：**  
+     多人构图必须采用**“一前一后，必有一背”**的前后物理纵深感。至少有一方以过肩镜头（OTS）或脏前景（dirty foreground）的方式出现，形成明确的 Z 轴空间层次。
+
+   - **长镜头/硬切判定：**  
+     若分镜内部包含“硬切”、“黑屏”或任何形式的画面跳转，**严禁**在该镜号中声明其为“连续长镜头（continuous shot / single take）”。只有完全无间断、仅靠运镜和焦点变化完成全部时序的镜头，才允许冠以长镜头描述。
+
+   - **格式要求：**  
+     严格按照下方指定的【输出固定格式】进行渲染，每个分镜中必须完整附带【全局约束】模块，且所有描述均需遵循上述铁律。
 
 ---
 
