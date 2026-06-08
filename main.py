@@ -385,6 +385,7 @@ async def login(request: Request):
         
         # 更新数据库中的登录状态和时间
         now_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+        now_ts = int(datetime.utcnow().timestamp())  # <--- 加上这一行！！！
         conn.execute("UPDATE users SET online=1, last_login=?, last_active_at=? WHERE username=?", (now_str, now_ts, username))
         conn.commit()
         conn.close()
