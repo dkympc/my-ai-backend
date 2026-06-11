@@ -298,10 +298,11 @@ ALLOWED_IMAGE_MODELS = [
     "seedream5.0"
 ]
 
+# 修改 IMAGE_MODEL_MAPPING
 IMAGE_MODEL_MAPPING = {
-    "seedream5.0": "seedream-5-0-260128",
-    "banana-pro": "gemini-3-pro-image-preview",
-    "banana2": "gemini-3.1-flash-image-preview" 
+    "seedream5.0": "seedream-5-0-260128",          # ✅ 修正
+    "banana-pro": "gemini-3-pro-image-preview-4k",        # ✅ 修正
+    "banana2": "gemini-3.1-flash-image-preview-4k"        # ✅ 新增
 }
 
 ALLOWED_VIDEO_MODELS = [
@@ -528,6 +529,7 @@ async def sync_user_sessions(request: Request, user_info: dict = Depends(verify_
             old_settings = existing_data.get("settings", {})
             old_settings.update(incoming_data.get("settings", {}))
             incoming_data["settings"] = old_settings
+            incoming_data["canvasProjects"] = merge_arrays(existing_data.get("canvasProjects", []), incoming_data.get("canvasProjects", []))
             
             incoming_json = json.dumps(incoming_data, ensure_ascii=False)
         except Exception as e:
@@ -610,7 +612,8 @@ async def get_user_sessions(user_info: dict = Depends(verify_token)):
         "imageHistory": [], 
         "videoHistory": [], 
         "wfSessions": [],
-        "settings": {}
+        "settings": {},
+        "canvasProjects": []
     })
 
 @app.get("/v1/admin/users/{username}/chats", dependencies=[Depends(verify_admin)])
@@ -781,6 +784,287 @@ async def save_media_permanently(media_data_or_url: str, ext: str, client: httpx
     # 如果下载失败（网络波动），退回使用大模型的原版链接兜底
     return media_data_or_url
 
+async def handle_gpt_image_edit(
+    prompt: str,
+    reference_images: list,
+    actual_api_key: str,
+    client: httpx.AsyncClient
+):
+    """
+    处理 GPT-Image-2-All 的图片编辑请求（multipart/form-data）
+    支持单张或多张参考图，下载 URL 或解码 base64 后作为文件上传
+    """
+    # 构造 multipart 表单
+    files = []
+    for idx, img_data in enumerate(reference_images):
+        content = None
+        filename = f"ref_{idx}.png"
+        content_type = "image/png"
+
+        if img_data.startswith("http"):
+            # 下载远程图片
+            resp = await client.get(img_data, timeout=30.0)
+            if resp.status_code == 200:
+                content = resp.content
+                ct = resp.headers.get("content-type", "")
+                if "jpeg" in ct or "jpg" in ct:
+                    content_type = "image/jpeg"
+                    filename = f"ref_{idx}.jpg"
+                elif "webp" in ct:
+                    content_type = "image/webp"
+                    filename = f"ref_{idx}.webp"
+            else:
+                logger.warning(f"无法下载参考图 {idx}: HTTP {resp.status_code}")
+                continue
+
+        elif img_data.startswith("data:"):
+            # base64 data URI
+            header, encoded = img_data.split(",", 1)
+            if "jpeg" in header or "jpg" in header:
+                content_type = "image/jpeg"
+                filename = f"ref_{idx}.jpg"
+            elif "webp" in header:
+                content_type = "image/webp"
+                filename = f"ref_{idx}.webp"
+            try:
+                content = base64.b64decode(encoded)
+            except Exception:
+                logger.error(f"无法解码 base64 参考图: {img_data[:100]}")
+                continue
+
+        elif img_data.startswith("/v1/static/media/"):
+            # 本地永久文件，直接从磁盘读取
+            file_name = img_data.split("/")[-1]
+            file_path = os.path.join(MEDIA_DIR, file_name)
+            try:
+                async with aiofiles.open(file_path, "rb") as f:
+                    content = await f.read()
+                low_name = file_name.lower()
+                if low_name.endswith(".jpg") or low_name.endswith(".jpeg"):
+                    content_type = "image/jpeg"
+                    filename = file_name
+                elif low_name.endswith(".webp"):
+                    content_type = "image/webp"
+                    filename = file_name
+                else:
+                    # 保留默认的 png，但文件名用实际名字
+                    filename = file_name
+                logger.info(f"📁 从本地读取参考图: {file_path}, 大小={len(content)} bytes")
+            except Exception:
+                logger.error(f"无法读取本地参考图: {file_path}")
+                continue
+
+        else:
+            # 可能已经是纯 base64（无 data 头），直接尝试解码
+            try:
+                content = base64.b64decode(img_data)
+            except Exception:
+                logger.error(f"无法解析参考图数据: {img_data[:100]}")
+                continue
+
+        if content:
+            files.append(("image", (filename, content, content_type)))
+
+    if not files:
+        raise ValueError("没有有效的参考图可供编辑")
+
+    # 构建请求体
+    data_fields = {
+        "model": "gpt-image-2-all",
+        "prompt": prompt,
+        "response_format": "url"
+    }
+
+    # 使用 httpx 构建 multipart 请求
+    resp = await client.post(
+        f"{NEW_API_BASE_URL}/v1/images/edits",
+        headers={"Authorization": f"Bearer {actual_api_key}"},
+        data=data_fields,
+        files=files,
+        timeout=300.0
+    )
+
+    if resp.status_code != 200:
+        error_body = resp.text
+        raise HTTPException(status_code=502, detail=f"GPT-Image-2-All 编辑失败: {resp.status_code} {error_body}")
+
+    result = resp.json()
+    image_url = None
+    if "data" in result and len(result["data"]) > 0:
+        item = result["data"][0]
+        image_url = item.get("url") or item.get("b64_json")
+
+    if image_url:
+        # 持久化结果
+        permanent_url = await save_media_permanently(image_url, "png", client)
+        return permanent_url
+    else:
+        raise HTTPException(status_code=500, detail="GPT-Image-2-All 未返回图片")
+
+async def handle_banana2_edit(
+    prompt: str,
+    reference_images: list,
+    actual_api_key: str,
+    client: httpx.AsyncClient,
+    target_ratio: str = "1:1"
+):
+    """
+    处理 Nano Banana 2 (gemini-3.1-flash-image-preview) 的图片编辑请求。
+    采用 /v1beta/models/...:generateContent 端点，JSON 格式提交 base64 图片。
+    支持单张或多张参考图，基于参考图 + prompt 生成新图。
+    """
+    # 1. 将所有参考图转换为 base64 字符串列表
+    parts = [{"text": prompt}]
+
+    for idx, img_data in enumerate(reference_images):
+        content_bytes = None
+        mime_type = "image/jpeg"  # 默认
+
+        if img_data.startswith("http"):
+            # 下载远程图片
+            resp = await client.get(img_data, timeout=30.0)
+            if resp.status_code == 200:
+                content_bytes = resp.content
+                ct = resp.headers.get("content-type", "")
+                if "png" in ct:
+                    mime_type = "image/png"
+                elif "webp" in ct:
+                    mime_type = "image/webp"
+            else:
+                logger.warning(f"无法下载参考图 {idx}: HTTP {resp.status_code}")
+                continue
+
+        elif img_data.startswith("data:"):
+            # base64 data URI
+            header, encoded = img_data.split(",", 1)
+            if "png" in header:
+                mime_type = "image/png"
+            elif "webp" in header:
+                mime_type = "image/webp"
+            try:
+                content_bytes = base64.b64decode(encoded)
+            except Exception:
+                logger.error(f"无法解码 base64 参考图: {img_data[:100]}")
+                continue
+
+        elif img_data.startswith("/v1/static/media/"):
+            # 本地永久文件，直接从磁盘读取
+            file_name = img_data.split("/")[-1]
+            file_path = os.path.join(MEDIA_DIR, file_name)
+            try:
+                async with aiofiles.open(file_path, "rb") as f:
+                    content_bytes = await f.read()
+                low_name = file_name.lower()
+                if low_name.endswith(".png"):
+                    mime_type = "image/png"
+                elif low_name.endswith(".jpg") or low_name.endswith(".jpeg"):
+                    mime_type = "image/jpeg"
+                elif low_name.endswith(".webp"):
+                    mime_type = "image/webp"
+                logger.info(f"📁 从本地读取参考图: {file_path}, 大小={len(content_bytes)} bytes")
+            except Exception:
+                logger.error(f"无法读取本地参考图: {file_path}")
+                continue
+
+        else:
+            # 纯 base64 字符串（无前缀）
+            try:
+                content_bytes = base64.b64decode(img_data)
+            except Exception:
+                logger.error(f"无法解析参考图 base64: {img_data[:100]}")
+                continue
+
+        if content_bytes:
+            # 将二进制重新编码为 base64 字符串
+            b64_str = base64.b64encode(content_bytes).decode("utf-8")
+            parts.append({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": b64_str
+                }
+            })
+
+    if len(parts) == 1:
+        raise ValueError("没有有效的参考图可供编辑")
+
+    # 2. 构造请求体
+    payload = {
+        "contents": [{
+            "parts": parts
+        }],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "aspectRatio": target_ratio,
+                "imageSize": "2K"
+            }
+        }
+    }
+
+    # 3. 发送请求到 Gemini 编辑端点
+    api_url = f"{NEW_API_BASE_URL}/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
+    headers = {
+        "Authorization": f"Bearer {actual_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    resp = await client.post(
+        api_url,
+        headers=headers,
+        json=payload,
+        timeout=300.0
+    )
+
+    if resp.status_code != 200:
+        error_body = resp.text
+        logger.error(f"Banana2 编辑失败: {resp.status_code} {error_body}")
+        raise HTTPException(status_code=502, detail=f"Banana2 编辑失败: {resp.status_code}")
+
+    # 4. 解析响应，提取生成图片的 base64（上游返回 Markdown 嵌入的 data URI）
+    try:
+        result = resp.json()
+        logger.info(f"🔍 Banana2 原始响应结构: {json.dumps(result, ensure_ascii=False)[:500]}")
+
+        img_b64_data_uri = None
+        parts = result["candidates"][0]["content"]["parts"]
+        for part in parts:
+            text = part.get("text", "")
+            # 从 Markdown 中提取 data URI：![image](data:image/jpeg;base64,...)
+            match = re.search(r'!\[.*?\]\((data:image/[^;]+;base64,[^)]+)\)', text)
+            if match:
+                img_b64_data_uri = match.group(1)
+                break
+
+        if not img_b64_data_uri:
+            logger.error(f"❌ Banana2 响应 text 中未找到 Markdown 图片 data URI，完整响应: {json.dumps(result, ensure_ascii=False)[:1000]}")
+            raise ValueError("响应中没有有效的图片 data URI")
+
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"解析 Banana2 响应失败: {e}, 完整响应: {resp.text[:1000]}")
+        raise HTTPException(status_code=500, detail="Banana2 未返回有效图片数据")
+
+    # 5. 将 data URI 图片保存为本地永久文件
+    file_id = uuid.uuid4().hex
+
+    header, pure_b64 = img_b64_data_uri.split(",", 1)
+    ext = "png"
+    if "jpeg" in header or "jpg" in header:
+        ext = "jpg"
+    elif "webp" in header:
+        ext = "webp"
+
+    file_name = f"{file_id}.{ext}"
+    file_path = os.path.join(MEDIA_DIR, file_name)
+    permanent_url = f"/v1/static/media/{file_name}"
+
+    try:
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(base64.b64decode(pure_b64))
+    except Exception as e:
+        logger.error(f"保存 Banana2 图片失败: {e}")
+        raise HTTPException(status_code=500, detail="图片保存失败")
+
+    return permanent_url
 # ==============================
 # 🖼️ 生图请求 (直连 New-API)
 # ==============================
@@ -811,6 +1095,10 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
     # 🔀 动态 API Key 路由
     actual_api_key = user_info.get("custom_api_key", "global")
     if actual_api_key == "global" or not actual_api_key: actual_api_key = NEW_API_KEY
+    
+    # 👇 新增：与聊天接口一样的清洗机制，防止 Sealos 环境变量注入的隐形空格导致 Apiyi 中转 401 拦截
+    actual_api_key = "".join(actual_api_key.split()).replace('"', '').replace("'", "")
+    
     if not actual_api_key: return _generic_error("未配置 API_KEY", 500)
     
     prompt_text = payload.get("prompt", "")
@@ -820,31 +1108,92 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
 
     reference_image = payload.get("image")
     reference_images = payload.get("images", [])
+    if reference_image and not reference_images:
+        reference_images = [reference_image]
+    logger.info(f"🔍 收到生图请求：model={requested_model}, 参考图数量={len(reference_images)}, 参考图列表={[r[:50] for r in reference_images]}")
+    # ==========================================
+    # 🆕 GPT-Image-2 编辑模式：有参考图时走 /v1/images/edits
+    # ==========================================
+    if requested_model == "gpt-image-2" and reference_images:
+        logger.info("🚀 触发 GPT-Image-2 编辑模式，将调用 /v1/images/edits")
+        client: httpx.AsyncClient = request.app.state.http_client
+        try:
+            permanent_url = await handle_gpt_image_edit(
+                prompt=prompt_text,
+                reference_images=reference_images,
+                actual_api_key=actual_api_key,
+                client=client
+            )
+            # 计费已在函数外完成，直接返回结果
+            return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
+        except Exception as e:
+            return _generic_error(f"图片编辑失败: {str(e)}", 500)
+
+    # ==========================================
+
+    elif requested_model == "banana2" and reference_images:
+        logger.info("🚀 触发 Banana2 编辑模式，调用 Gemini generateContent")
+        client: httpx.AsyncClient = request.app.state.http_client
+        try:
+            permanent_url = await handle_banana2_edit(
+                prompt=prompt_text,
+                reference_images=reference_images,
+                actual_api_key=actual_api_key,
+                client=client,
+                target_ratio=target_ratio   # 这个变量在前面已经定义
+           )
+            return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
+        except Exception as e:
+            return _generic_error(f"Banana2 编辑失败: {str(e)}", 500)
+
+    # ==========================================
 
     if requested_model in ["banana-pro", "banana2"]:
         prompt_text = f"{prompt_text}, aspect ratio {target_ratio}, --ar {target_ratio}"
 
+    # 构造基础 payload（各模型通用参数）
     safe_payload = {
-        "prompt": prompt_text, 
-        "n": 1, 
+        "prompt": prompt_text,
+        "n": 1,
         "size": target_size,
         "watermark": False,
-        "add_watermark": False,
-        "is_add_watermark": False,
-        "logo_info": {"add_logo": False}
     }
 
-    if reference_images:
-        safe_payload["images"] = reference_images
-        if not reference_image: safe_payload["image"] = reference_images[0]
-    elif reference_image:
-        safe_payload["image"] = reference_image
-        safe_payload["images"] = [reference_image]
+    # ---- seedream 专属参数 ----
+    if requested_model == "seedream5.0":
+        safe_payload["output_format"] = "png"
 
+    # ---- banana 系列专属 ----
     if requested_model in ["banana-pro", "banana2"]:
         safe_payload["aspect_ratio"] = target_ratio
         safe_payload["aspectRatio"] = target_ratio
-        
+
+    # ---- 参考图（注意：seedream 的参考图不走这里，它需要公网 URL）----
+    if reference_images:
+        safe_payload["images"] = reference_images
+        if not reference_image:
+            safe_payload["image"] = reference_images[0]
+    elif reference_image:
+        safe_payload["image"] = reference_image
+        safe_payload["images"] = [reference_image]
+    
+    # ---- 尺寸安全校验：Seedream 必须 ≥ 2K ----
+    if requested_model == "seedream5.0":
+        try:
+            w_str, h_str = safe_payload.get("size", "1024x1024").split("x")
+            w, h = int(w_str), int(h_str)
+            if w * h < 3686400:  # 低于 1920x1920 即视为不安全
+                safe_fallback = {
+                    "1:1": "1920x1920",
+                    "16:9": "2560x1440",
+                    "9:16": "1440x2560",
+                    "4:3": "2048x1536"
+                }.get(target_ratio, "2048x2048")
+                logger.warning(f"⚠️ Seedream 尺寸 {safe_payload['size']} 过小，自动提升为 {safe_fallback}")
+                safe_payload["size"] = safe_fallback
+        except Exception:
+            pass  # 解析失败不处理
+
     client: httpx.AsyncClient = request.app.state.http_client
     candidate_models = ["gpt-image-2-all", "gpt-image-2", "gpt-image-2-vip"] if requested_model == "gpt-image-2" else [IMAGE_MODEL_MAPPING.get(requested_model, requested_model)]
 
@@ -1367,6 +1716,10 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
         actual_api_key = user_info.get("custom_api_key", "global")
         if actual_api_key == "global" or not actual_api_key: 
             actual_api_key = NEW_API_KEY
+            
+        # 👇 新增：严格清洗脏字符
+        actual_api_key = "".join(actual_api_key.split()).replace('"', '').replace("'", "")
+        
         if not actual_api_key: 
             return _generic_error("未配置 API_KEY", 500)
 
