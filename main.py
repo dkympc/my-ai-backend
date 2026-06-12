@@ -324,7 +324,18 @@ async def lifespan(app: FastAPI):
         await app.state.http_client.aclose()
 
 app = FastAPI(title="YR AI Proxy Backend", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
-# 🚨 核心挂载：让前端通过网址 /v1/static/media 能访问到本地硬盘里的媒体文件
+
+# ==========================================
+# 👇 加入下面这段，专门用来忽悠 K8s 的底层保安
+# ==========================================
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    """应对各种云平台的存活检测"""
+    return {"status": "ok", "message": "Backend is running flawlessly!"}
+# ==========================================
+
+# 下面是你原有的代码
 app.mount("/v1/static/media", StaticFiles(directory=MEDIA_DIR), name="static_media")
 app.add_middleware(
     CORSMiddleware,
