@@ -59,12 +59,14 @@ import httpx
 import jwt
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse, FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 # --- 新增的持久化所需的依赖 ---
 import base64
 import uuid
+import re
+import os
 import aiofiles
 import zipfile
 import xml.etree.ElementTree as ET
@@ -83,9 +85,10 @@ logging.basicConfig(level=logging.INFO)
 import os
 
 # 1. 动态获取数据库路径，并设置媒体目录
-DB_FILE = os.getenv("DB_PATH", "data/yr_ai.db")
-DATA_DIR = os.path.dirname(DB_FILE) or "."
-MEDIA_DIR = os.path.join(DATA_DIR, "media")
+DB_FILE = os.getenv("DB_PATH", "/app/data/yr_ai.db")
+DATA_DIR = os.path.dirname(DB_FILE) or "/app/data"
+# 统一使用绝对路径，确保和 Docker 的 -v $(pwd)/media:/app/media 对应！
+MEDIA_DIR = "/app/media"
 
 # 2. 启动时自动创建存放数据的物理文件夹
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -135,16 +138,21 @@ def init_db():
     cursor.execute("UPDATE users SET allow_workflow=1 WHERE allow_workflow=-1")
     conn.commit()
         
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS activity_logs (
-            id TEXT PRIMARY KEY, time TEXT, username TEXT, action TEXT, model TEXT, details TEXT
-        )
-    ''')
+    # === 原来的代码保留，在下面追加 ===
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_sessions (
             username TEXT PRIMARY KEY, sessions_data TEXT
         )
     ''')
+    
+    # 🚀 数据库重构：新建 6 张独立的高性能表，解决单表 JSON 锁死问题
+    cursor.execute('CREATE TABLE IF NOT EXISTS user_settings (username TEXT PRIMARY KEY, data TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS chat_sessions (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS image_history (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS video_history (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS wf_sessions (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS canvas_projects (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
+    
     conn.commit()
     
     # --- 自动从 .env 同步账号 ---
@@ -182,7 +190,10 @@ def init_db():
 init_db()
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    # 增加 timeout 防止偶尔的锁表报错
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10.0)
+    # 🚀 核心修复：开启 WAL 模式，允许多人同时读写数据库，告别 Database is locked！
+    conn.execute('PRAGMA journal_mode=WAL;') 
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -293,16 +304,14 @@ ALLOWED_MODELS = [
 
 ALLOWED_IMAGE_MODELS = [
     "gpt-image-2", 
-    "banana2", 
     "banana-pro", 
     "seedream5.0"
 ]
 
 # 修改 IMAGE_MODEL_MAPPING
 IMAGE_MODEL_MAPPING = {
-    "seedream5.0": "seedream-5-0-260128",          # ✅ 修正
-    "banana-pro": "gemini-3-pro-image-preview-4k",        # ✅ 修正
-    "banana2": "gemini-3.1-flash-image-preview-4k"        # ✅ 新增
+    "seedream5.0": "seedream-5-0-260128",          # ✅ Seedream 5.0 正式版模型名
+    "banana-pro": "gemini-3-pro-image-preview"     # ✅ 对齐谷歌官方标准 Pro 预览版模型名
 }
 
 ALLOWED_VIDEO_MODELS = [
@@ -317,7 +326,14 @@ VIDEO_MODEL_MAPPING = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http_client = httpx.AsyncClient(timeout=None, trust_env=False)
+    # 🚀 强制底层网络使用 IPv4，防止 Docker 内网傻等 IPv6 解析超时
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+    # 这里初始化一个全局的 client，其他所有接口都在用它
+    app.state.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0), # 给等待画图/视频的时间设置 5 分钟上限
+        trust_env=False,
+        transport=transport
+    )
     try:
         yield
     finally:
@@ -335,11 +351,10 @@ async def health_check():
     return {"status": "ok", "message": "Backend is running flawlessly!"}
 # ==========================================
 
-# 下面是你原有的代码
-app.mount("/v1/static/media", StaticFiles(directory=MEDIA_DIR), name="static_media")
+# 修改了跨域允许名单，放开限制，让公网也能顺利访问
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], 
+    allow_origins=["*"],  # <--- 改成 "*" (星号)，代表允许所有域名的前端访问
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -424,6 +439,39 @@ async def logout(user_info: dict = Depends(verify_token)):
     conn.close()
     return JSONResponse(content={"message": "已注销"})
 
+@app.post("/v1/user/recharge", dependencies=[Depends(verify_token)])
+async def test_recharge(user_info: dict = Depends(verify_token)):
+    """开发者专属福利：点击一次，狂送 1000 万算力额度"""
+    username = user_info["username"]
+    conn = get_db_connection()
+    try:
+        # 给当前用户强行加上一千万
+        conn.execute("UPDATE users SET token_balance = token_balance + 10000000 WHERE username = ?", (username,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse(content={"error": {"message": str(e)}}, status_code=500)
+    finally:
+        conn.close()
+        
+    return JSONResponse(content={"message": "充值成功！1000万算力已到账。"})
+
+@app.post("/v1/admin/users/{target_username}/recharge", dependencies=[Depends(verify_admin)])
+async def admin_recharge_user(target_username: str):
+    """管理员专属：给指定用户充值 1000 万算力"""
+    conn = get_db_connection()
+    try:
+        # 注意这里：WHERE username = target_username (给传进来的那个人充值)
+        conn.execute("UPDATE users SET token_balance = token_balance + 10000000 WHERE username = ?", (target_username,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return JSONResponse(content={"error": {"message": str(e)}}, status_code=500)
+    finally:
+        conn.close()
+        
+    return JSONResponse(content={"message": f"成功给 {target_username} 充值 1000 万！"})    
+
 @app.post("/v1/user/heartbeat", dependencies=[Depends(verify_token)])
 async def user_heartbeat(user_info: dict = Depends(verify_token)):
     """接收前端心跳，更新最后活跃时间"""
@@ -466,96 +514,124 @@ async def get_admin_users():
             "allow_workflow": bool(u["allow_workflow"])
         })
     return JSONResponse(content={"data": users_data})
-@app.post("/v1/admin/users/{username}/action", dependencies=[Depends(verify_admin)])
-async def admin_user_action(username: str, request: Request):
-    """管理员操作 (充值 / 踢下线 / 切换权限)"""
-    data = await request.json()
-    action = data.get("action")
-    amount = data.get("amount", 100000)
+
+@app.get("/v1/admin/users/{username}/chats", dependencies=[Depends(verify_admin)])
+async def admin_get_user_chats(username: str):
+    """管理员大屏拉取指定用户记录（独立表重构版）"""
+    conn = get_db_connection()
+    
+    def fetch_array(table_name):
+        rows = conn.execute(f"SELECT data FROM {table_name} WHERE username=? ORDER BY updated_at DESC", (username,)).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+        
+    data = {
+        "chats": fetch_array("chat_sessions"),
+        "images": fetch_array("image_history"),
+        "videos": fetch_array("video_history"),
+        "workflows": fetch_array("wf_sessions")
+    }
+    conn.close()
+        
+    return JSONResponse(content={"data": data})
+
+
+def purify_base64_images(data):
+    """递归遍历整个 JSON，把所有的 Base64 图片提取成文件，并替换为轻量级 URL"""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, str) and v.startswith("data:image/"):
+                data[k] = _save_base64_to_file(v)
+            else:
+                data[k] = purify_base64_images(v)
+    elif isinstance(data, list):
+        for i in range(len(data)):
+            if isinstance(data[i], str) and data[i].startswith("data:image/"):
+                data[i] = _save_base64_to_file(data[i])
+            else:
+                data[i] = purify_base64_images(data[i])
+    return data
+
+def _save_base64_to_file(base64_str):
+    """物理落地：把 Base64 转成真实文件存进硬盘"""
+    try:
+        header, encoded = base64_str.split(",", 1)
+        match = re.search(r'data:image/(.*?);', header)
+        ext = match.group(1) if match else "png"
+        if ext == "jpeg": ext = "jpg"
+        
+        filename = f"{uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(MEDIA_DIR, filename)
+        
+        with open(filepath, "wb") as f:
+            f.write(base64.b64decode(encoded))
+            
+        # （修改后）强行指路到后端的 8000 端口去拿货！
+        return f"http://82.157.193.46:8000/v1/static/media/{filename}"
+    except Exception as e:
+        print(f"Base64 提取失败: {e}")
+        return base64_str
+# 👆 ---- 【净化器代码到这里结束】 ---- 👆
+
+
+
+# 👇 ---- 【这里是你刚才大改过的那个接口，保持不变，只要加上 incoming_data = purify... 那一行就行】 ---- 👇
+# ==============================
+# 🚀 改造后的数据同步接口 (后台线程版)
+# ==============================
+def _process_sync_data_in_thread(incoming_data, username):
+    """专门在后台干苦力的函数：解包Base64和写入数据库"""
+    # 1. 净化 Base64 图片
+    processed_data = purify_base64_images(incoming_data)
     
     conn = get_db_connection()
-    user = conn.execute("SELECT username FROM users WHERE username=?", (username,)).fetchone()
-    if not user:
-        conn.close()
-        return _generic_error("用户不存在", 404)
+    try:
+        # 2. 独立保存设置
+        if "settings" in processed_data:
+            conn.execute("INSERT OR REPLACE INTO user_settings (username, data) VALUES (?, ?)", 
+                         (username, json.dumps(processed_data["settings"], ensure_ascii=False)))
         
-    if action == "recharge": 
-        conn.execute("UPDATE users SET token_balance = token_balance + ? WHERE username=?", (amount, username))
-    elif action == "reset_tokens": 
-        conn.execute("UPDATE users SET tokens_used=0 WHERE username=?", (username,))
-# 找到 elif action == "kick": 这一行
-    elif action == "kick": 
-        conn.execute("UPDATE users SET online=0, last_active_at=0 WHERE username=?", (username,))
-    elif action == "update_permission":
-        # ✨ 新增：处理前端传来的权限切换请求
-        perm_type = data.get("perm_type")
-        perm_value = int(data.get("perm_value", 0))
-        if perm_type in ["allow_chat", "allow_image", "allow_video", "allow_workflow"]:
-            conn.execute(f"UPDATE users SET {perm_type}=? WHERE username=?", (perm_value, username))
-            
-    conn.commit()
-    conn.close()
-    return JSONResponse(content={"message": "操作成功"})
+        # 3. 封装批量插入
+        def sync_array(table_name, arr):
+            if not isinstance(arr, list): return
+            for item in arr:
+                if isinstance(item, dict) and "id" in item:
+                    updated_at = 0
+                    try:
+                        ts = item.get("updatedAt", item.get("timestamp", 0))
+                        if isinstance(ts, (int, float)): updated_at = int(ts)
+                    except: pass
+                    
+                    conn.execute(f"INSERT OR REPLACE INTO {table_name} (id, username, updated_at, data) VALUES (?, ?, ?, ?)",
+                                 (item["id"], username, updated_at, json.dumps(item, ensure_ascii=False)))
+
+        # 4. 分发到各表
+        sync_array("chat_sessions", processed_data.get("sessions", []))
+        sync_array("image_history", processed_data.get("imageHistory", []))
+        sync_array("video_history", processed_data.get("videoHistory", []))
+        sync_array("wf_sessions", processed_data.get("wfSessions", []))
+        sync_array("canvas_projects", processed_data.get("canvasProjects", []))
+        
+        conn.commit()
+    except Exception as e:
+        logger.error(f"拆分同步失败: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 @app.post("/v1/user/sync_sessions", dependencies=[Depends(verify_token)])
 async def sync_user_sessions(request: Request, user_info: dict = Depends(verify_token)):
-    """接收前端发来的同步请求，将完整多模态记录落盘到 SQLite (智能合并防覆盖版)"""
+    """前台接待员：收到包就立刻扔给后台干活，瞬间释放通道"""
     try:
-        raw_body = await request.body()
-        incoming_json = raw_body.decode('utf-8')
-        incoming_data = json.loads(incoming_json)
+        incoming_data = await request.json()
     except Exception:
         return _generic_error("Invalid JSON", 400)
         
     username = user_info["username"]
-    conn = get_db_connection()
     
-    # ✨ 核心修复：取出老数据，进行基于 ID 的深度合并（彻底解决多页签互相覆盖的问题）
-    existing_row = conn.execute("SELECT sessions_data FROM user_sessions WHERE username=?", (username,)).fetchone()
-    
-    if existing_row and existing_row["sessions_data"]:
-        try:
-            existing_data = json.loads(existing_row["sessions_data"])
-            
-            def merge_arrays(old_arr, new_arr):
-                if not isinstance(old_arr, list) or not isinstance(new_arr, list): return new_arr
-                # 以 ID 为主键建立字典，新数据覆盖老数据，老数据不丢失
-                merged_dict = {item.get("id"): item for item in old_arr if isinstance(item, dict) and "id" in item}
-                for item in new_arr:
-                    if isinstance(item, dict) and "id" in item:
-                        merged_dict[item["id"]] = item
-                # 将合并后的字典转回列表，按时间倒序排序
-                merged_list = list(merged_dict.values())
-                try: merged_list.sort(key=lambda x: x.get("updatedAt", x.get("timestamp", 0)), reverse=True)
-                except Exception: pass
-                return merged_list
-            
-            # 分别合并四大核心记录数组
-            incoming_data["sessions"] = merge_arrays(existing_data.get("sessions", []), incoming_data.get("sessions", []))
-            incoming_data["imageHistory"] = merge_arrays(existing_data.get("imageHistory", []), incoming_data.get("imageHistory", []))
-            incoming_data["videoHistory"] = merge_arrays(existing_data.get("videoHistory", []), incoming_data.get("videoHistory", []))
-            incoming_data["wfSessions"] = merge_arrays(existing_data.get("wfSessions", []), incoming_data.get("wfSessions", []))
-            
-            # Settings 字段直接更新覆盖
-            old_settings = existing_data.get("settings", {})
-            old_settings.update(incoming_data.get("settings", {}))
-            incoming_data["settings"] = old_settings
-            incoming_data["canvasProjects"] = merge_arrays(existing_data.get("canvasProjects", []), incoming_data.get("canvasProjects", []))
-            
-            incoming_json = json.dumps(incoming_data, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"合并JSON失败: {e}")
-            pass # 如果合并失败，退回使用新数据兜底
-
-    conn.execute("""
-        INSERT INTO user_sessions (username, sessions_data) 
-        VALUES (?, ?)
-        ON CONFLICT(username) DO UPDATE SET sessions_data=excluded.sessions_data
-    """, (username, incoming_json))
-    conn.commit()
-    conn.close()
-    
-    return JSONResponse(content={"message": "数据已同步"})
+    # 🚀 把上面的干苦力函数丢进系统线程池，不阻塞主干道！
+    await asyncio.to_thread(_process_sync_data_in_thread, incoming_data, username)
+        
+    return JSONResponse(content={"message": "数据已在后台排队同步成功"})
 
 # 👆 确保上面那个函数的 return 已经正常结束，并且上面的代码没有留着未闭合的缩进
 
@@ -607,47 +683,31 @@ async def parse_document(request: Request):
 # ==============================
 @app.get("/v1/user/sessions", dependencies=[Depends(verify_token)])
 async def get_user_sessions(user_info: dict = Depends(verify_token)):
-    """用户刷新页面或换电脑登录时，从 SQLite 拉取自己的全部历史记录"""
+    """重构版：从各独立表中分别拉取数据，组装成前端需要的格式"""
     username = user_info["username"]
     conn = get_db_connection()
-    row = conn.execute("SELECT sessions_data FROM user_sessions WHERE username=?", (username,)).fetchone()
-    conn.close()
     
-    if row and row["sessions_data"]:
-        # 直接返回数据库里存的 JSON 字符串，不消耗额外解析性能
-        return Response(content=row["sessions_data"], media_type="application/json")
-    
-    # 如果是纯新用户，返回空结构，防止前端报错
-    return JSONResponse(content={
-        "sessions": [], 
-        "imageHistory": [], 
-        "videoHistory": [], 
-        "wfSessions": [],
-        "settings": {},
-        "canvasProjects": []
-    })
-
-@app.get("/v1/admin/users/{username}/chats", dependencies=[Depends(verify_admin)])
-async def admin_get_user_chats(username: str):
-    """管理员获取指定用户的全维度生成记录"""
-    conn = get_db_connection()
-    row = conn.execute("SELECT sessions_data FROM user_sessions WHERE username=?", (username,)).fetchone()
-    conn.close()
-    
-    if row and row["sessions_data"]:
-        raw_data = json.loads(row["sessions_data"])
-        # ⚠️ 修复 Bug：在这里做一个精准的字段映射
-        # 把用户存上来的字段名，翻译成 Admin 前端大屏需要的字段名
-        data = {
-            "chats": raw_data.get("sessions", []),
-            "images": raw_data.get("imageHistory", []),
-            "videos": raw_data.get("videoHistory", []),
-            "workflows": raw_data.get("wfSessions", [])
-        }
-    else:
-        data = {"chats": [], "images": [], "videos": [], "workflows": []}
+    # 封装一个读取函数，按时间倒序拿数据
+    def fetch_array(table_name):
+        rows = conn.execute(f"SELECT data FROM {table_name} WHERE username=? ORDER BY updated_at DESC", (username,)).fetchall()
+        return [json.loads(row["data"]) for row in rows]
         
-    return JSONResponse(content={"data": data})
+    # 读取设置
+    settings_row = conn.execute("SELECT data FROM user_settings WHERE username=?", (username,)).fetchone()
+    settings = json.loads(settings_row["data"]) if settings_row else {}
+    
+    # 完美拼装成原有的数据结构返回给前端
+    data = {
+        "sessions": fetch_array("chat_sessions"),
+        "imageHistory": fetch_array("image_history"),
+        "videoHistory": fetch_array("video_history"),
+        "wfSessions": fetch_array("wf_sessions"),
+        "canvasProjects": fetch_array("canvas_projects"),
+        "settings": settings
+    }
+    
+    conn.close()
+    return JSONResponse(content=data)
 
 # ==============================
 # 💬 对话请求 (直连 New-API)
@@ -771,7 +831,7 @@ async def save_media_permanently(media_data_or_url: str, ext: str, client: httpx
     file_id = uuid.uuid4().hex
     file_name = f"{file_id}.{ext}"
     file_path = os.path.join(MEDIA_DIR, file_name)
-    permanent_url = f"/v1/static/media/{file_name}"
+    permanent_url = f"http://82.157.193.46:8000/v1/static/media/{file_name}"
     
     try:
         # 场景 A：处理临时外链 (如快手/字节视频、DALL-E图片)
@@ -912,173 +972,6 @@ async def handle_gpt_image_edit(
     else:
         raise HTTPException(status_code=500, detail="GPT-Image-2-All 未返回图片")
 
-async def handle_banana2_edit(
-    prompt: str,
-    reference_images: list,
-    actual_api_key: str,
-    client: httpx.AsyncClient,
-    target_ratio: str = "1:1"
-):
-    """
-    处理 Nano Banana 2 (gemini-3.1-flash-image-preview) 的图片编辑请求。
-    采用 /v1beta/models/...:generateContent 端点，JSON 格式提交 base64 图片。
-    支持单张或多张参考图，基于参考图 + prompt 生成新图。
-    """
-    # 1. 将所有参考图转换为 base64 字符串列表
-    parts = [{"text": prompt}]
-
-    for idx, img_data in enumerate(reference_images):
-        content_bytes = None
-        mime_type = "image/jpeg"  # 默认
-
-        if img_data.startswith("http"):
-            # 下载远程图片
-            resp = await client.get(img_data, timeout=30.0)
-            if resp.status_code == 200:
-                content_bytes = resp.content
-                ct = resp.headers.get("content-type", "")
-                if "png" in ct:
-                    mime_type = "image/png"
-                elif "webp" in ct:
-                    mime_type = "image/webp"
-            else:
-                logger.warning(f"无法下载参考图 {idx}: HTTP {resp.status_code}")
-                continue
-
-        elif img_data.startswith("data:"):
-            # base64 data URI
-            header, encoded = img_data.split(",", 1)
-            if "png" in header:
-                mime_type = "image/png"
-            elif "webp" in header:
-                mime_type = "image/webp"
-            try:
-                content_bytes = base64.b64decode(encoded)
-            except Exception:
-                logger.error(f"无法解码 base64 参考图: {img_data[:100]}")
-                continue
-
-        elif img_data.startswith("/v1/static/media/"):
-            # 本地永久文件，直接从磁盘读取
-            file_name = img_data.split("/")[-1]
-            file_path = os.path.join(MEDIA_DIR, file_name)
-            try:
-                async with aiofiles.open(file_path, "rb") as f:
-                    content_bytes = await f.read()
-                low_name = file_name.lower()
-                if low_name.endswith(".png"):
-                    mime_type = "image/png"
-                elif low_name.endswith(".jpg") or low_name.endswith(".jpeg"):
-                    mime_type = "image/jpeg"
-                elif low_name.endswith(".webp"):
-                    mime_type = "image/webp"
-                logger.info(f"📁 从本地读取参考图: {file_path}, 大小={len(content_bytes)} bytes")
-            except Exception:
-                logger.error(f"无法读取本地参考图: {file_path}")
-                continue
-
-        else:
-            # 纯 base64 字符串（无前缀）
-            try:
-                content_bytes = base64.b64decode(img_data)
-            except Exception:
-                logger.error(f"无法解析参考图 base64: {img_data[:100]}")
-                continue
-
-        if content_bytes:
-            # 将二进制重新编码为 base64 字符串
-            b64_str = base64.b64encode(content_bytes).decode("utf-8")
-            parts.append({
-                "inlineData": {
-                    "mimeType": mime_type,
-                    "data": b64_str
-                }
-            })
-
-    if len(parts) == 1:
-        raise ValueError("没有有效的参考图可供编辑")
-
-    # 2. 构造请求体
-    payload = {
-        "contents": [{
-            "parts": parts
-        }],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"],
-            "imageConfig": {
-                "aspectRatio": target_ratio,
-                "imageSize": "2K"
-            }
-        }
-    }
-
-    # 3. 发送请求到 Gemini 编辑端点
-    api_url = f"{NEW_API_BASE_URL}/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
-    headers = {
-        "Authorization": f"Bearer {actual_api_key}",
-        "Content-Type": "application/json"
-    }
-
-    resp = await client.post(
-        api_url,
-        headers=headers,
-        json=payload,
-        timeout=300.0
-    )
-
-    if resp.status_code != 200:
-        error_body = resp.text
-        logger.error(f"Banana2 编辑失败: {resp.status_code} {error_body}")
-        raise HTTPException(status_code=502, detail=f"Banana2 编辑失败: {resp.status_code}")
-
-    # 4. 解析响应，提取生成图片的 base64（上游返回 Markdown 嵌入的 data URI）
-    try:
-        result = resp.json()
-        logger.info(f"🔍 Banana2 原始响应结构: {json.dumps(result, ensure_ascii=False)[:500]}")
-
-        img_b64_data_uri = None
-        parts = result["candidates"][0]["content"]["parts"]
-        for part in parts:
-            text = part.get("text", "")
-            # 从 Markdown 中提取 data URI：![image](data:image/jpeg;base64,...)
-            match = re.search(r'!\[.*?\]\((data:image/[^;]+;base64,[^)]+)\)', text)
-            if match:
-                img_b64_data_uri = match.group(1)
-                break
-
-        if not img_b64_data_uri:
-            logger.error(f"❌ Banana2 响应 text 中未找到 Markdown 图片 data URI，完整响应: {json.dumps(result, ensure_ascii=False)[:1000]}")
-            raise ValueError("响应中没有有效的图片 data URI")
-
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"解析 Banana2 响应失败: {e}, 完整响应: {resp.text[:1000]}")
-        raise HTTPException(status_code=500, detail="Banana2 未返回有效图片数据")
-
-    # 5. 将 data URI 图片保存为本地永久文件
-    file_id = uuid.uuid4().hex
-
-    header, pure_b64 = img_b64_data_uri.split(",", 1)
-    ext = "png"
-    if "jpeg" in header or "jpg" in header:
-        ext = "jpg"
-    elif "webp" in header:
-        ext = "webp"
-
-    file_name = f"{file_id}.{ext}"
-    file_path = os.path.join(MEDIA_DIR, file_name)
-    permanent_url = f"/v1/static/media/{file_name}"
-
-    try:
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(base64.b64decode(pure_b64))
-    except Exception as e:
-        logger.error(f"保存 Banana2 图片失败: {e}")
-        raise HTTPException(status_code=500, detail="图片保存失败")
-
-    return permanent_url
-# ==============================
-# 🖼️ 生图请求 (直连 New-API)
-# ==============================
 @app.post("/v1/images/generations")
 async def image_generations(request: Request, user_info: dict = Depends(verify_token)):
     # 👇 注意缩进
@@ -1142,40 +1035,39 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
 
     # ==========================================
 
-    elif requested_model == "banana2" and reference_images:
-        logger.info("🚀 触发 Banana2 编辑模式，调用 Gemini generateContent")
-        client: httpx.AsyncClient = request.app.state.http_client
-        try:
-            permanent_url = await handle_banana2_edit(
-                prompt=prompt_text,
-                reference_images=reference_images,
-                actual_api_key=actual_api_key,
-                client=client,
-                target_ratio=target_ratio   # 这个变量在前面已经定义
-           )
-            return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
-        except Exception as e:
-            return _generic_error(f"Banana2 编辑失败: {str(e)}", 500)
-
-    # ==========================================
-
-    if requested_model in ["banana-pro", "banana2"]:
-        prompt_text = f"{prompt_text}, aspect ratio {target_ratio}, --ar {target_ratio}"
+    elif requested_model == "seedream5.0" and reference_images:
+        logger.info("🚀 触发 Seedream 5.0 图编辑 (去脏重绘) 模式，无损透传 URL 数组")
+        # 格式化 safe_payload 为火山标准
+        safe_payload = {
+            "model": "seedream-5-0-260128",
+            "prompt": prompt_text,
+            "image": reference_images,  # 火山格式：URL 数组，不支持二进制
+            "sequential_image_generation": "disabled",
+            "size": target_size if target_size != "auto" else "2K",
+            "output_format": "png",
+            "watermark": False
+        }
+        # 后面逻辑中需要防止 safe_payload 被默认构造覆盖，因此这里可以直接利用 if-else 分支控制
+    
+    # ✅ 已净化 Prompt 强制拼装
+    pass
 
     # 构造基础 payload（各模型通用参数）
-    safe_payload = {
-        "prompt": prompt_text,
-        "n": 1,
-        "size": target_size,
-        "watermark": False,
-    }
+    # 🚨 如果刚才已经由特殊编辑模式组装了 safe_payload，则直接跳过默认组装
+    if "safe_payload" not in locals():
+        safe_payload = {
+            "prompt": prompt_text,
+            "n": 1,
+            "size": target_size if target_size != "auto" else "1024x1024",
+            "watermark": False,
+        }
 
     # ---- seedream 专属参数 ----
     if requested_model == "seedream5.0":
         safe_payload["output_format"] = "png"
 
     # ---- banana 系列专属 ----
-    if requested_model in ["banana-pro", "banana2"]:
+    if requested_model == "banana-pro":
         safe_payload["aspect_ratio"] = target_ratio
         safe_payload["aspectRatio"] = target_ratio
 
@@ -1765,6 +1657,21 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
 
         except Exception as e: return _generic_error(f"Workflow Engine Error: {str(e)}", 500)
     else: return _generic_error(f"Engine not implemented.", 501)
+
+# ==============================
+# 🖼️ 专治 Canvas 跨域碎图的静态文件接口
+# ==============================
+@app.get("/v1/static/media/{filename}")
+async def get_static_media(filename: str):
+    """
+    废除 app.mount，改用标准 API 路由返回图片。
+    这样图片就能完美继承 CORSMiddleware 的跨域许可，
+    彻底解决前端 Canvas 节点的跨域拦截和碎图问题！
+    """
+    file_path = os.path.join(MEDIA_DIR, filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    raise HTTPException(status_code=404, detail="图片未找到")
 
 if __name__ == "__main__":
     import uvicorn
