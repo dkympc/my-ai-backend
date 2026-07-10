@@ -49,6 +49,7 @@ import json
 import logging         
 import os
 import re
+import secrets
 import traceback
 import sqlite3
 from contextlib import asynccontextmanager
@@ -129,6 +130,13 @@ def init_db():
         # ✨ 新增：心跳时间戳字段，无损迁移
     try: cursor.execute("ALTER TABLE users ADD COLUMN last_active_at INTEGER DEFAULT 0")
     except sqlite3.OperationalError: pass
+    # 🆕 用户自定义 API 地址与 Key（自助注册用）
+    try: cursor.execute("ALTER TABLE users ADD COLUMN api_base_url TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE users ADD COLUMN dmx_base_url TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
+    try: cursor.execute("ALTER TABLE users ADD COLUMN dmx_api_key TEXT DEFAULT ''")
+    except sqlite3.OperationalError: pass
 
     # ✨ 执行无损数据修正：给老数据赋予正确的默认权限（tester默认禁图文，其他人全开）
     cursor.execute("UPDATE users SET allow_chat=0 WHERE allow_chat=-1 AND role='tester'")
@@ -153,37 +161,49 @@ def init_db():
     cursor.execute('CREATE TABLE IF NOT EXISTS wf_sessions (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
     cursor.execute('CREATE TABLE IF NOT EXISTS canvas_projects (id TEXT PRIMARY KEY, username TEXT, updated_at INTEGER, data TEXT)')
     
-    conn.commit()
-    
-    # --- 自动从 .env 同步账号 ---
-    ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "admindyr:dyr31918:admin:1:global")
-    ALLOWED_USERS_STR = ALLOWED_USERS_STR.replace("\n", "").replace('"', '')
-    
-    for pair in ALLOWED_USERS_STR.split(","):
-        if not pair.strip(): continue 
-        parts = pair.split(":")
-        if len(parts) >= 2:
-            u, p = parts[0].strip(), parts[1].strip()
-            r = parts[2].strip() if len(parts) > 2 else "user"
-            v = int(parts[3].strip()) if len(parts) > 3 else 1 # 1=允许视频
-            k = parts[4].strip() if len(parts) > 4 else "global"
-            
-            cursor.execute("SELECT username FROM users WHERE username=?", (u,))
-            if not cursor.fetchone():
-                # 如果是新账号，tester 默认无图文权限，只开工作流
-                chat_val = 0 if r == 'tester' else 1
-                img_val = 0 if r == 'tester' else 1
-                wf_val = 1
-                cursor.execute("""
-                    INSERT INTO users 
-                    (username, password, role, online, tokens_used, token_balance, last_login, allow_video, custom_api_key, allow_chat, allow_image, allow_workflow) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (u, p, r, False, 0, 500000, "从未登录", v, k, chat_val, img_val, wf_val))
-            else:
-                # 🚨 如果用户已存在，只同步密码和角色，绝不覆盖权限（保护管理员在 UI 上做的修改）
-                cursor.execute("UPDATE users SET password=?, role=?, custom_api_key=? WHERE username=?", (p, r, k, u))
+    # 🆕 一次性邀请码表（管理员生成，24小时过期，用一次即失效）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS invite_codes (
+            code TEXT PRIMARY KEY,
+            created_by TEXT,
+            created_at INTEGER,
+            expires_at INTEGER,
+            used_by TEXT DEFAULT NULL,
+            used_at INTEGER DEFAULT NULL
+        )
+    ''')
     
     conn.commit()
+    
+    # --- 仅首次建库时从 .env 导入 ALLOWED_USERS 账号，已存在则跳过 ---
+    user_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if user_count == 0:
+        ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "admindyr:dyr31918:admin:1:global")
+        ALLOWED_USERS_STR = ALLOWED_USERS_STR.replace("\n", "").replace('"', '')
+        
+        for pair in ALLOWED_USERS_STR.split(","):
+            if not pair.strip(): continue 
+            parts = pair.split(":")
+            if len(parts) >= 2:
+                u, p = parts[0].strip(), parts[1].strip()
+                r = parts[2].strip() if len(parts) > 2 else "user"
+                v = int(parts[3].strip()) if len(parts) > 3 else 1
+                k = parts[4].strip() if len(parts) > 4 else "global"
+                
+                cursor.execute("SELECT username FROM users WHERE username=?", (u,))
+                if not cursor.fetchone():
+                    chat_val = 0 if r == 'tester' else 1
+                    img_val = 0 if r == 'tester' else 1
+                    wf_val = 1
+                    cursor.execute("""
+                        INSERT INTO users 
+                        (username, password, role, online, tokens_used, token_balance, last_login, allow_video, custom_api_key, allow_chat, allow_image, allow_workflow) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (u, p, r, False, 0, 500000, "从未登录", v, k, chat_val, img_val, wf_val))
+                else:
+                    cursor.execute("UPDATE users SET role=? WHERE username=?", (r, u))
+        conn.commit()
+        
     conn.close()
 
 # 启动时执行建库
@@ -262,7 +282,7 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
             conn.close()
             raise HTTPException(status_code=401, detail="您已被强制下线或账号已被禁用")
 
-        # ✨ 修改：将四个权限开关全部提取并下发
+        # ✨ 修改：将四个权限开关加上 API 配置全部提取并下发
         user_info = {
             "username": username, 
             "role": user["role"],
@@ -270,7 +290,11 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
             "allow_image": bool(user["allow_image"]),
             "allow_video": bool(user["allow_video"]),
             "allow_workflow": bool(user["allow_workflow"]),
-            "custom_api_key": user["custom_api_key"]
+            "custom_api_key": user["custom_api_key"],
+            # 🆕 用户自定义 API 地址
+            "api_base_url": user["api_base_url"] if "api_base_url" in user.keys() else "",
+            "dmx_base_url": user["dmx_base_url"] if "dmx_base_url" in user.keys() else "",
+            "dmx_api_key": user["dmx_api_key"] if "dmx_api_key" in user.keys() else ""
         }
         conn.close()
         return user_info
@@ -294,6 +318,52 @@ DMX_API_KEY = os.getenv("DMX_API_KEY", "").split("#")[0].strip()
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.5-flash").split("#")[0].strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+
+# 🆕 注册邀请码（从 .env 读取，注册时校验）
+REGISTER_INVITE_CODE = os.getenv("REGISTER_INVITE_CODE", "").strip()
+
+def resolve_api_config(user_info: dict):
+    """
+    🆕 解析用户的 API 配置（Key 和 Base URL）。
+
+    逻辑：
+    - custom_api_key == "global" 或 空 → 使用全局 Key（向后兼容）
+    - custom_api_key 是真实 Key → 使用自己的 Key
+    - URL 没填就用全局的 NEW_API_BASE_URL
+
+    返回：{ api_key, api_base, dmx_key, dmx_base }
+    """
+    custom_key = (user_info.get("custom_api_key") or "").strip()
+    custom_base = (user_info.get("api_base_url") or "").strip()
+    dmx_custom_key = (user_info.get("dmx_api_key") or "").strip()
+    dmx_custom_base = (user_info.get("dmx_base_url") or "").strip()
+
+    clean = lambda s: "".join(s.split()).replace('"', '').replace("'", "")
+
+    # --- New-API（聊天/生图/工作流）---
+    if custom_key == "global" or not custom_key:
+        # 老用户/管理员/未配置 → 使用全局 Key 和 URL
+        api_key = NEW_API_KEY
+        api_base = NEW_API_BASE_URL
+    else:
+        # 用户有自己的 Key → 用用户的 Key，URL 没填就用全局的
+        api_key = clean(custom_key)
+        api_base = custom_base.rstrip("/") if custom_base else NEW_API_BASE_URL
+
+    # --- DMX API（生视频）---
+    if dmx_custom_key:
+        dmx_key = clean(dmx_custom_key)
+        dmx_base = dmx_custom_base.rstrip("/") if dmx_custom_base else DMX_API_BASE_URL
+    else:
+        dmx_key = DMX_API_KEY
+        dmx_base = DMX_API_BASE_URL
+
+    return {
+        "api_key": api_key,
+        "api_base": api_base,
+        "dmx_key": dmx_key,
+        "dmx_base": dmx_base
+    }
 
 ALLOWED_MODELS = [
     "gpt-5.4", 
@@ -429,6 +499,94 @@ async def login(request: Request):
         conn.close()
         return JSONResponse(status_code=401, content={"error": {"message": "账号或密码错误"}})
 
+# 🆕 新增：用户注册接口（邀请码制）
+@app.post("/v1/register")
+async def register(request: Request):
+    """用户自助注册：需要填写邀请码，可选填自己的 API Key 和 Base URL"""
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    invite_code = (data.get("invite_code") or "").strip()
+    
+    # 🆕 用户自定义 API 配置（注册时可填，也可后续在设置中补填）
+    api_key = (data.get("api_key") or "").strip()
+    api_base_url = (data.get("api_base_url") or "").strip()
+    dmx_api_key = (data.get("dmx_api_key") or "").strip()
+    dmx_base_url = (data.get("dmx_base_url") or "").strip()
+    
+    # ---- 基础校验 ----
+    if not username or not password:
+        return _generic_error("用户名和密码不能为空", 400)
+    if len(username) < 2 or len(username) > 20:
+        return _generic_error("用户名长度需在 2-20 个字符之间", 400)
+    if len(password) < 4:
+        return _generic_error("密码长度至少 4 位", 400)
+    
+    # ---- 邀请码校验（一次性，24小时有效） ----
+    if not invite_code:
+        return _generic_error("需要填写邀请码才能注册，请联系管理员获取", 400)
+    
+    conn = get_db_connection()
+    now_ts = int(datetime.utcnow().timestamp())
+    
+    # 查邀请码是否有效
+    code_row = conn.execute(
+        "SELECT * FROM invite_codes WHERE code=? AND used_by IS NULL",
+        (invite_code.upper().strip(),)  # 统一转大写忽略大小写
+    ).fetchone()
+    
+    if not code_row:
+        conn.close()
+        return _generic_error("邀请码无效或已被使用", 400)
+    
+    if code_row["expires_at"] <= now_ts:
+        conn.close()
+        return _generic_error("该邀请码已过期（超过24小时未使用）", 400)
+    
+    # ---- 检查用户名是否已存在 ----
+    existing = conn.execute("SELECT username FROM users WHERE username=?", (username,)).fetchone()
+    if existing:
+        conn.close()
+        return _generic_error("该用户名已被注册，请换一个", 400)
+    
+    # ---- 创建用户 ----
+    # 新注册用户默认角色为 user，余额 500,000，开放聊天和生图权限
+    conn.execute("""
+        INSERT INTO users 
+        (username, password, role, online, tokens_used, token_balance, last_login, 
+         allow_video, custom_api_key, allow_chat, allow_image, allow_workflow,
+         api_base_url, dmx_base_url, dmx_api_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        username, password, "user", False, 0, 500000, "从未登录",
+        1,  # 允许生视频
+        "",  # API Key 必须后续在设置中配置
+        1,  # 允许聊天
+        1,  # 允许生图
+        1,  # 允许工作流
+        "",  # api_base_url 待配置
+        "",  # dmx_base_url 待配置
+        "",  # dmx_api_key 待配置
+    ))
+    
+    # 🆕 标记邀请码已使用
+    conn.execute(
+        "UPDATE invite_codes SET used_by=?, used_at=? WHERE code=?",
+        (username, now_ts, invite_code.upper().strip())
+    )
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"新用户注册成功: {username}（邀请码: {invite_code.upper().strip()}）")
+    return JSONResponse(content={
+        "message": "注册成功！请使用您的账号密码登录。",
+        "username": username
+    })
+
 @app.post("/v1/logout", dependencies=[Depends(verify_token)])
 async def logout(user_info: dict = Depends(verify_token)):
     username = user_info["username"]
@@ -470,7 +628,180 @@ async def admin_recharge_user(target_username: str):
     finally:
         conn.close()
         
-    return JSONResponse(content={"message": f"成功给 {target_username} 充值 1000 万！"})    
+    return JSONResponse(content={"message": f"成功给 {target_username} 充值 1000 万！"})
+
+# 🆕 补全：管理员操作用户（踢人/清零/修改权限）
+@app.post("/v1/admin/users/{target_username}/action", dependencies=[Depends(verify_admin)])
+async def admin_user_action(target_username: str, request: Request):
+    """管理员对指定用户执行操作：kick / reset_tokens / update_permission"""
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    action = data.get("action", "")
+    conn = get_db_connection()
+    
+    try:
+        if action == "kick":
+            # 强制下线：online=0
+            conn.execute("UPDATE users SET online=0, last_active_at=0 WHERE username=?", (target_username,))
+            conn.commit()
+            logger.info(f"管理员强制下线用户: {target_username}")
+            return JSONResponse(content={"message": f"已强制下线 {target_username}"})
+        
+        elif action == "reset_tokens":
+            # 清零消耗
+            conn.execute("UPDATE users SET tokens_used=0 WHERE username=?", (target_username,))
+            conn.commit()
+            logger.info(f"管理员清零消耗: {target_username}")
+            return JSONResponse(content={"message": f"已清零 {target_username} 的消耗记录"})
+        
+        elif action == "update_permission":
+            # 修改权限开关——兼容两种格式：
+            # 格式A（前端逐个toggle）：{ perm_type: "allow_chat", perm_value: true }
+            # 格式B（批量设置）：{ permission: { allow_chat: 1, ... } }
+            perm_type = data.get("perm_type", "")
+            perm_value = data.get("perm_value", None)
+            
+            if perm_type and perm_value is not None:
+                # 格式A：单个权限toggle
+                valid_perms = ["allow_chat", "allow_image", "allow_video", "allow_workflow"]
+                if perm_type in valid_perms:
+                    conn.execute(f"UPDATE users SET {perm_type}=? WHERE username=?", (int(perm_value), target_username))
+            else:
+                # 格式B：批量设置
+                permission = data.get("permission", {})
+                allow_chat = int(permission.get("allow_chat", 1))
+                allow_image = int(permission.get("allow_image", 1))
+                allow_video = int(permission.get("allow_video", 1))
+                allow_workflow = int(permission.get("allow_workflow", 1))
+                conn.execute("""
+                    UPDATE users 
+                    SET allow_chat=?, allow_image=?, allow_video=?, allow_workflow=?
+                    WHERE username=?
+                """, (allow_chat, allow_image, allow_video, allow_workflow, target_username))
+            
+            conn.commit()
+            logger.info(f"管理员更新权限: {target_username}")
+        
+        else:
+            return _generic_error(f"不支持的操作: {action}", 400)
+    except Exception as e:
+        conn.rollback()
+        return _generic_error(f"操作失败: {str(e)}", 500)
+    finally:
+        conn.close()
+
+# 🆕 管理员手动新增用户
+@app.post("/v1/admin/users/create", dependencies=[Depends(verify_admin)])
+async def admin_create_user(request: Request):
+    """管理员手动创建用户"""
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    role = (data.get("role") or "user").strip()
+    
+    if not username or not password:
+        return _generic_error("用户名和密码不能为空", 400)
+    
+    conn = get_db_connection()
+    existing = conn.execute("SELECT username FROM users WHERE username=?", (username,)).fetchone()
+    if existing:
+        conn.close()
+        return _generic_error("该用户名已存在", 400)
+    
+    conn.execute("""
+        INSERT INTO users 
+        (username, password, role, online, tokens_used, token_balance, last_login,
+         allow_video, custom_api_key, allow_chat, allow_image, allow_workflow)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (username, password, role, False, 0, 500000, "从未登录", 1, "global", 1, 1, 1))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"管理员创建用户: {username} (角色: {role})")
+    return JSONResponse(content={"message": f"用户 {username} 创建成功", "username": username})
+
+# 🆕 管理员重置用户密码
+@app.post("/v1/admin/users/{target_username}/reset-password", dependencies=[Depends(verify_admin)])
+async def admin_reset_password(target_username: str, request: Request):
+    """管理员重置指定用户的密码"""
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    new_password = (data.get("new_password") or "").strip()
+    if len(new_password) < 4:
+        return _generic_error("密码长度至少 4 位", 400)
+    
+    conn = get_db_connection()
+    user = conn.execute("SELECT username FROM users WHERE username=?", (target_username,)).fetchone()
+    if not user:
+        conn.close()
+        return _generic_error(f"用户 {target_username} 不存在", 404)
+    
+    conn.execute("UPDATE users SET password=? WHERE username=?", (new_password, target_username))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"管理员重置密码: {target_username}")
+    return JSONResponse(content={"message": f"已重置 {target_username} 的密码"})
+
+# 🆕 邀请码管理：管理员生成一次性邀请码（24小时有效，用一次失效）
+import secrets
+
+@app.post("/v1/admin/invite-codes/generate", dependencies=[Depends(verify_admin)])
+async def generate_invite_code(user_info: dict = Depends(verify_admin)):
+    """管理员生成一个一次性邀请码，24小时过期，仅供一人注册一次"""
+    code = secrets.token_hex(4).upper()  # 8位十六进制，如 "A3F8B2C1"
+    now_ts = int(datetime.utcnow().timestamp())
+    expires_ts = now_ts + 86400  # 24小时后过期
+    
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO invite_codes (code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (code, user_info["username"], now_ts, expires_ts)
+    )
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"管理员 {user_info['username']} 生成邀请码: {code}")
+    return JSONResponse(content={
+        "code": code,
+        "expires_at": expires_ts,
+        "message": f"邀请码 {code} 已生成，24小时内有效，仅供一人注册一次"
+    })
+
+@app.get("/v1/admin/invite-codes", dependencies=[Depends(verify_admin)])
+async def list_invite_codes():
+    """管理员查看所有邀请码及其使用状态"""
+    conn = get_db_connection()
+    codes = conn.execute(
+        "SELECT * FROM invite_codes ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    
+    now_ts = int(datetime.utcnow().timestamp())
+    result = []
+    for c in codes:
+        created_at_str = datetime.utcfromtimestamp(c["created_at"]).strftime("%Y-%m-%d %H:%M UTC")
+        result.append({
+            "code": c["code"],
+            "created_by": c["created_by"],
+            "created_at": created_at_str,
+            "expires_in_seconds": max(0, c["expires_at"] - now_ts),
+            "is_expired": c["expires_at"] <= now_ts,
+            "is_used": c["used_by"] is not None,
+            "used_by": c["used_by"],
+            "used_at": datetime.utcfromtimestamp(c["used_at"]).strftime("%Y-%m-%d %H:%M UTC") if c["used_at"] else None
+        })
+    return JSONResponse(content={"data": result})    
 
 @app.post("/v1/user/heartbeat", dependencies=[Depends(verify_token)])
 async def user_heartbeat(user_info: dict = Depends(verify_token)):
@@ -484,6 +815,73 @@ async def user_heartbeat(user_info: dict = Depends(verify_token)):
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "alive"})
+
+# 🆕 新增：用户修改密码
+@app.post("/v1/user/change-password", dependencies=[Depends(verify_token)])
+async def change_password(request: Request, user_info: dict = Depends(verify_token)):
+    """用户自行修改密码：需要验证旧密码"""
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    old_password = (data.get("old_password") or "").strip()
+    new_password = (data.get("new_password") or "").strip()
+    
+    if not old_password or not new_password:
+        return _generic_error("旧密码和新密码不能为空", 400)
+    if len(new_password) < 4:
+        return _generic_error("新密码长度至少 4 位", 400)
+    
+    username = user_info["username"]
+    conn = get_db_connection()
+    user = conn.execute("SELECT password FROM users WHERE username=?", (username,)).fetchone()
+    
+    if not user or user["password"] != old_password:
+        conn.close()
+        return _generic_error("旧密码不正确", 400)
+    
+    conn.execute("UPDATE users SET password=? WHERE username=?", (new_password, username))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"用户 {username} 修改了密码")
+    return JSONResponse(content={"message": "密码修改成功"})
+
+# 🆕 新增：用户更新 API 配置
+@app.post("/v1/user/update-api-config", dependencies=[Depends(verify_token)])
+async def update_api_config(request: Request, user_info: dict = Depends(verify_token)):
+    """
+    用户自行配置自己的 API Key 和 Base URL。
+    支持分别设置 New-API（聊天/生图/工作流）和 DMX API（生视频）。
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+    
+    username = user_info["username"]
+    api_key = (data.get("api_key") or "").strip()
+    api_base_url = (data.get("api_base_url") or "").strip()
+    dmx_api_key = (data.get("dmx_api_key") or "").strip()
+    dmx_base_url = (data.get("dmx_base_url") or "").strip()
+    
+    # 清洗字符串
+    clean = lambda s: "".join(s.split()).replace('"', '').replace("'", "")
+    api_key_clean = clean(api_key) if api_key else ""
+    dmx_api_key_clean = clean(dmx_api_key) if dmx_api_key else ""
+    
+    conn = get_db_connection()
+    conn.execute("""
+        UPDATE users 
+        SET custom_api_key=?, api_base_url=?, dmx_api_key=?, dmx_base_url=?
+        WHERE username=?
+    """, (api_key_clean if api_key_clean else "", api_base_url, dmx_api_key_clean if dmx_api_key_clean else "", dmx_base_url, username))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"用户 {username} 更新了 API 配置 (New-API Key: {'已设置' if api_key_clean else '未配置'}, DMX Key: {'已设置' if dmx_api_key_clean else '未配置'})")
+    return JSONResponse(content={"message": "API 配置已更新"})
 
 # ==============================
 @app.get("/v1/admin/users", dependencies=[Depends(verify_admin)])
@@ -725,11 +1123,10 @@ async def chat_completions(request: Request, user_info: dict = Depends(verify_to
     conn.close()
     
     # 🔀 动态 API Key 路由
-    actual_api_key = user_info.get("custom_api_key", "global")
-    if actual_api_key == "global" or not actual_api_key: actual_api_key = NEW_API_KEY
-    actual_api_key = "".join(actual_api_key.split()).replace('"', '').replace("'", "")
+    api_config = resolve_api_config(user_info)
+    actual_api_key = api_config["api_key"]
+    actual_api_base = api_config["api_base"]
     
-    if not actual_api_key: return _generic_error("未配置 API_KEY", 500)
     try: payload = await request.json()
     except Exception: return _generic_error("Invalid JSON", 400)
 
@@ -790,7 +1187,8 @@ async def chat_completions(request: Request, user_info: dict = Depends(verify_to
     
     client: httpx.AsyncClient = request.app.state.http_client
     try:
-        upstream_request = client.build_request("POST", f"{NEW_API_BASE_URL}/v1/chat/completions", headers=_build_upstream_headers(actual_api_key, is_stream), json=payload)
+        # 🆕 使用用户自己的 API Base URL 代替全局 URL
+        upstream_request = client.build_request("POST", f"{actual_api_base}/v1/chat/completions", headers=_build_upstream_headers(actual_api_key, is_stream), json=payload)
         upstream_response = await client.send(upstream_request, stream=True)
 
         if upstream_response.status_code >= 400:
@@ -859,6 +1257,7 @@ async def handle_gpt_image_edit(
     prompt: str,
     reference_images: list,
     actual_api_key: str,
+    actual_api_base: str,
     client: httpx.AsyncClient
 ):
     """
@@ -948,7 +1347,7 @@ async def handle_gpt_image_edit(
 
     # 使用 httpx 构建 multipart 请求
     resp = await client.post(
-        f"{NEW_API_BASE_URL}/v1/images/edits",
+        f"{actual_api_base}/v1/images/edits",
         headers={"Authorization": f"Bearer {actual_api_key}"},
         data=data_fields,
         files=files,
@@ -974,7 +1373,6 @@ async def handle_gpt_image_edit(
 
 @app.post("/v1/images/generations")
 async def image_generations(request: Request, user_info: dict = Depends(verify_token)):
-    # 👇 注意缩进
     if not user_info.get("allow_image", True):
         raise HTTPException(status_code=403, detail="抱歉，您的账号未开通 [图像生成] 权限，请联系管理员。")
 
@@ -996,14 +1394,13 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
     conn.commit()
     conn.close()
     
-    # 🔀 动态 API Key 路由
-    actual_api_key = user_info.get("custom_api_key", "global")
-    if actual_api_key == "global" or not actual_api_key: actual_api_key = NEW_API_KEY
+    # 🔀 动态 API Key 路由：使用统一解析函数
+    api_config = resolve_api_config(user_info)
+    actual_api_key = api_config["api_key"]
+    actual_api_base = api_config["api_base"]
     
-    # 👇 新增：与聊天接口一样的清洗机制，防止 Sealos 环境变量注入的隐形空格导致 Apiyi 中转 401 拦截
-    actual_api_key = "".join(actual_api_key.split()).replace('"', '').replace("'", "")
-    
-    if not actual_api_key: return _generic_error("未配置 API_KEY", 500)
+    if not actual_api_key:
+        return _generic_error("您尚未配置 AI API Key，请在设置 → API 配置中填入您的中转站 Key 和 Base URL", 400)
     
     prompt_text = payload.get("prompt", "")
     target_size = payload.get("size", "1024x1024")
@@ -1026,6 +1423,7 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
                 prompt=prompt_text,
                 reference_images=reference_images,
                 actual_api_key=actual_api_key,
+                actual_api_base=actual_api_base,
                 client=client
             )
             # 计费已在函数外完成，直接返回结果
@@ -1106,13 +1504,15 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
         safe_payload["model"] = attempt_model
         try:
             upstream_response = await client.post(
-                f"{NEW_API_BASE_URL}/v1/images/generations",
+                f"{actual_api_base}/v1/images/generations",
                 headers=_build_upstream_headers(actual_api_key, False),
                 json=safe_payload,
                 timeout=300.0  
             )
             content = upstream_response.content 
             last_response, last_content = upstream_response, content
+
+            logger.info(f"[ImageGen] {attempt_model} → HTTP {upstream_response.status_code}")
 
             if upstream_response.status_code == 200:
                 try:
@@ -1167,8 +1567,15 @@ async def video_generations(request: Request, user_info: dict = Depends(verify_t
         # 🚫 多租户视频权限强拦截
     if not user_info.get("allow_video", True):
         raise HTTPException(status_code=403, detail="抱歉，您的账号未开通 AI 视频生成权限，请联系管理员。")
-    if not DMX_API_KEY: return _generic_error("未配置 DMX_API_KEY", 500)
-    if not DMX_API_KEY: return _generic_error("未配置 DMX_API_KEY", 500)
+    
+    # 🆕 使用统一解析函数获取 DMX API 配置
+    api_config = resolve_api_config(user_info)
+    dmx_api_key = api_config["dmx_key"]
+    dmx_api_base = api_config["dmx_base"]
+    
+    if not dmx_api_key:
+        return _generic_error("您尚未配置视频生成 API Key，请在设置 → API 配置中填入您的 DMX API Key 和 Base URL", 400)
+    
     try: payload = await request.json()
     except Exception: return _generic_error("Invalid JSON", 400)
 
@@ -1206,7 +1613,7 @@ async def video_generations(request: Request, user_info: dict = Depends(verify_t
 
     # 1. 组装请求参数
     if target_model in ["doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-260128"]:
-        target_url = f"{DMX_API_BASE_URL}/v1/responses"
+        target_url = f"{dmx_api_base}/v1/responses"
         inputs = []
         if mode == "i2v" and ref_images: inputs.append({"type": "image_url", "image_url": {"url": ref_images[0]}})
         elif mode == "i2v-both" and len(ref_images) >= 2:
@@ -1223,7 +1630,7 @@ async def video_generations(request: Request, user_info: dict = Depends(verify_t
         }
         
     elif target_model == "kling-v3-video-generation":
-        target_url = f"{DMX_API_BASE_URL}/v1/responses"
+        target_url = f"{dmx_api_base}/v1/responses"
         actual_model = "kling-v3-video-generation"
         inputs = {"prompt": prompt}
         
@@ -1243,7 +1650,7 @@ async def video_generations(request: Request, user_info: dict = Depends(verify_t
     # 2. 提交任务，立即返回 task_id 给前端
     try:
         logger.info(f"👉 提交异步视频任务 ({target_model})")
-        headers = {"Content-Type": "application/json", "Authorization": DMX_API_KEY}
+        headers = {"Content-Type": "application/json", "Authorization": dmx_api_key}
         resp = await client.post(target_url, headers=headers, json=target_payload, timeout=30.0)
         
         if resp.status_code != 200: 
@@ -1281,16 +1688,21 @@ async def video_status(request: Request, user_info: dict = Depends(verify_token)
     
     if not task_id or not poll_model: return _generic_error("缺少 task_id 或 model", 400)
     
+    # 🆕 使用统一解析函数获取 DMX API 配置
+    api_config = resolve_api_config(user_info)
+    dmx_api_key = api_config["dmx_key"]
+    dmx_api_base = api_config["dmx_base"]
+    
     client: httpx.AsyncClient = request.app.state.http_client
-    target_url = f"{DMX_API_BASE_URL}/v1/responses"
+    target_url = f"{dmx_api_base}/v1/responses"
     poll_payload = {"model": poll_model, "input": task_id}
-    headers = {"Content-Type": "application/json", "Authorization": DMX_API_KEY}
+    headers = {"Content-Type": "application/json", "Authorization": dmx_api_key}
     
     try:
         poll_resp = await client.post(target_url, headers=headers, json=poll_payload, timeout=30.0)
         # 兼容 DMXAPI 偶尔的 token 传参格式差异
         if poll_resp.status_code == 403: 
-            poll_resp = await client.post(target_url, headers={"Content-Type": "application/json", "Authorization": f"Bearer {DMX_API_KEY}"}, json=poll_payload, timeout=30.0)
+            poll_resp = await client.post(target_url, headers={"Content-Type": "application/json", "Authorization": f"Bearer {dmx_api_key}"}, json=poll_payload, timeout=30.0)
             
         if poll_resp.status_code == 200:
             inner_data = json.loads(poll_resp.json()["output"][0]["content"][0]["text"])
@@ -1615,21 +2027,15 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
             "max_tokens": 65536
         }
 
-        # 🔀 动态 API Key 路由 (新增)
-        actual_api_key = user_info.get("custom_api_key", "global")
-        if actual_api_key == "global" or not actual_api_key: 
-            actual_api_key = NEW_API_KEY
-            
-        # 👇 新增：严格清洗脏字符
-        actual_api_key = "".join(actual_api_key.split()).replace('"', '').replace("'", "")
-        
-        if not actual_api_key: 
-            return _generic_error("未配置 API_KEY", 500)
+        # 🔀 动态 API Key 路由
+        api_config = resolve_api_config(user_info)
+        actual_api_key = api_config["api_key"]
+        actual_api_base = api_config["api_base"]
 
         client: httpx.AsyncClient = request.app.state.http_client
         try:
-            # 🚨 注意这里：把 _build_upstream_headers 里的 NEW_API_KEY 改成了 actual_api_key
-            upstream_request = client.build_request("POST", f"{NEW_API_BASE_URL}/v1/chat/completions", headers=_build_upstream_headers(actual_api_key, True), json=upstream_payload)
+            # 🆕 使用用户自己的 API Base URL
+            upstream_request = client.build_request("POST", f"{actual_api_base}/v1/chat/completions", headers=_build_upstream_headers(actual_api_key, True), json=upstream_payload)
             upstream_response = await client.send(upstream_request, stream=True)
 
             if upstream_response.status_code >= 400:
