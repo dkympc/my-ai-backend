@@ -805,15 +805,7 @@ async def list_invite_codes():
 
 @app.post("/v1/user/heartbeat", dependencies=[Depends(verify_token)])
 async def user_heartbeat(user_info: dict = Depends(verify_token)):
-    """接收前端心跳，更新最后活跃时间"""
-    username = user_info["username"]
-    now_ts = int(datetime.utcnow().timestamp())
-    
-    conn = get_db_connection()
-    # 仅更新时间戳，操作极快
-    conn.execute("UPDATE users SET last_active_at=? WHERE username=?", (now_ts, username))
-    conn.commit()
-    conn.close()
+    """接收前端心跳，仅做连接监测，不写入数据库（减少写入压力）"""
     return JSONResponse(content={"status": "alive"})
 
 # 🆕 新增：用户修改密码
@@ -1094,29 +1086,48 @@ async def parse_document(request: Request):
 # ✨ 新增：前端初始化时拉取云端数据
 # ==============================
 @app.get("/v1/user/sessions", dependencies=[Depends(verify_token)])
-async def get_user_sessions(user_info: dict = Depends(verify_token)):
-    """重构版：从各独立表中分别拉取数据，组装成前端需要的格式"""
+async def get_user_sessions(modules: str = "all", user_info: dict = Depends(verify_token)):
+    """按需拉取云端数据。
+    
+    modules 参数控制返回哪些模块的数据（逗号分隔），减少不必要的数据传输：
+      - all（默认）：返回全部 6 张表的数据（向后兼容）
+      - canvas：仅返回 canvas_projects + settings（画布刷新专用，最快）
+      - chat,image,video,workflow：按需组合
+    
+    示例：?modules=canvas → { settings, canvasProjects }
+          ?modules=chat,image → { settings, sessions, imageHistory }
+    """
     username = user_info["username"]
     conn = get_db_connection()
     
-    # 封装一个读取函数，按时间倒序拿数据
+    # 封装读取函数，按时间倒序拿数据
     def fetch_array(table_name):
         rows = conn.execute(f"SELECT data FROM {table_name} WHERE username=? ORDER BY updated_at DESC", (username,)).fetchall()
         return [json.loads(row["data"]) for row in rows]
-        
-    # 读取设置
+    
+    # 解析请求的模块集合（None = 全部）
+    requested = None if modules == "all" else set(modules.split(","))
+    
+    # settings 体积小且前端多处依赖，总是返回
     settings_row = conn.execute("SELECT data FROM user_settings WHERE username=?", (username,)).fetchone()
     settings = json.loads(settings_row["data"]) if settings_row else {}
     
-    # 完美拼装成原有的数据结构返回给前端
-    data = {
-        "sessions": fetch_array("chat_sessions"),
-        "imageHistory": fetch_array("image_history"),
-        "videoHistory": fetch_array("video_history"),
-        "wfSessions": fetch_array("wf_sessions"),
-        "canvasProjects": fetch_array("canvas_projects"),
-        "settings": settings
-    }
+    data = {"settings": settings}
+    
+    if not requested or "canvas" in requested:
+        data["canvasProjects"] = fetch_array("canvas_projects")
+    
+    if not requested or "chat" in requested:
+        data["sessions"] = fetch_array("chat_sessions")
+    
+    if not requested or "image" in requested:
+        data["imageHistory"] = fetch_array("image_history")
+    
+    if not requested or "video" in requested:
+        data["videoHistory"] = fetch_array("video_history")
+    
+    if not requested or "workflow" in requested:
+        data["wfSessions"] = fetch_array("wf_sessions")
     
     conn.close()
     return JSONResponse(content=data)
