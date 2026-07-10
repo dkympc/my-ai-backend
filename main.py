@@ -988,11 +988,15 @@ def _process_sync_data_in_thread(incoming_data, username):
             conn.execute("INSERT OR REPLACE INTO user_settings (username, data) VALUES (?, ?)", 
                          (username, json.dumps(processed_data["settings"], ensure_ascii=False)))
         
-        # 3. 封装批量插入
+        # 3. 封装批量插入 + 僵尸行清理
         def sync_array(table_name, arr):
             if not isinstance(arr, list): return
+            
+            # ★ 收集传入数组中的所有项目 ID，用于后续清理不在数组中的僵尸行
+            incoming_ids = set()
             for item in arr:
                 if isinstance(item, dict) and "id" in item:
+                    incoming_ids.add(item["id"])
                     updated_at = 0
                     try:
                         ts = item.get("updatedAt", item.get("timestamp", 0))
@@ -1001,6 +1005,16 @@ def _process_sync_data_in_thread(incoming_data, username):
                     
                     conn.execute(f"INSERT OR REPLACE INTO {table_name} (id, username, updated_at, data) VALUES (?, ?, ?, ?)",
                                  (item["id"], username, updated_at, json.dumps(item, ensure_ascii=False)))
+            
+            # ★ 清理僵尸行：删除该用户在该表中已不存在于传入数组的旧行
+            # 这确保了前端删除项目后，后端数据库也真正删除
+            if incoming_ids:
+                placeholders = ','.join(['?' for _ in incoming_ids])
+                conn.execute(f"DELETE FROM {table_name} WHERE username = ? AND id NOT IN ({placeholders})",
+                             (username, *incoming_ids))
+            else:
+                # 传入空数组 → 删除该用户该表的所有行
+                conn.execute(f"DELETE FROM {table_name} WHERE username = ?", (username,))
 
         # 4. 分发到各表
         sync_array("chat_sessions", processed_data.get("sessions", []))
