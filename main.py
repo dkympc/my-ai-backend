@@ -1258,19 +1258,27 @@ async def save_media_permanently(media_data_or_url: str, ext: str, client: httpx
     try:
         # 场景 A：处理临时外链 (如快手/字节视频、DALL-E图片)
         # BytePlus TOS 签名 URL 可能有多次重定向，需要 follow_redirects + Accept 头部
+        # 使用流式分块下载 (aiter_bytes)，避免慢速连接下 resp.content 一次性读取超时
         if media_data_or_url.startswith("http"):
             download_headers = {
                 "Accept": "image/*,*/*;q=0.8",
                 "User-Agent": "YT-AI-Media-Server/2.0"
             }
             resp = await client.get(media_data_or_url, headers=download_headers, timeout=120.0, follow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 0:
+            if resp.status_code == 200:
                 async with aiofiles.open(file_path, "wb") as f:
-                    await f.write(resp.content)
-                logger.info(f"[MediaSave] 下载成功 ({len(resp.content)} bytes) → {file_name}")
-                return permanent_url
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        await f.write(chunk)
+                # 验证文件大小非空
+                file_stat = os.stat(file_path)
+                if file_stat.st_size > 0:
+                    logger.info(f"[MediaSave] 流式下载成功 ({file_stat.st_size} bytes) → {file_name}")
+                    return permanent_url
+                else:
+                    logger.error(f"[MediaSave] 下载文件为空: {file_name}")
+                    os.remove(file_path)
             else:
-                logger.warning(f"[MediaSave] 下载失败 HTTP {resp.status_code}, size={len(resp.content)}, url={media_data_or_url[:80]}")
+                logger.warning(f"[MediaSave] 下载失败 HTTP {resp.status_code}, url={media_data_or_url[:80]}")
                 
         # 场景 B：处理超大 Base64 字符串
         elif media_data_or_url.startswith("data:"):
@@ -1662,33 +1670,21 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
                     resp_json = json.loads(content)
 
                     # ★ Seedream 5.0 专用处理：响应格式固定为 { data: [{ url, size }] }
-                    # BytePlus TOS 临时签名 URL (~24h) 必须立即下载转存，不可直接返给前端
-                    # 直接返外链会导致：CORS 拦截、域名不可达、URL 过期 → 前端图片破碎
+                    # BytePlus TOS 临时签名 URL (~24h) 必须下载转存到本地，外链直接返前端会因跨域/时效导致图片破碎
                     if requested_model == "seedream5.0":
                         if "data" in resp_json and isinstance(resp_json["data"], list) and len(resp_json["data"]) > 0:
                             seedream_url = resp_json["data"][0].get("url")
                             if seedream_url and seedream_url.startswith("http"):
                                 logger.info(f"[Seedream] BytePlus TOS 链接: {seedream_url[:80]}")
-                                # 策略：先同步下载 15s，若超时则返回 TOS 临时链接给前端先显示，后台静默转存
-                                try:
-                                    permanent_url = await asyncio.wait_for(
-                                        save_media_permanently(seedream_url, "png", client),
-                                        timeout=15.0
-                                    )
-                                    if permanent_url.startswith("/v1/static/media/"):
-                                        logger.info(f"[Seedream] 转存成功: {permanent_url}")
-                                        return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
-                                    else:
-                                        logger.warning(f"[Seedream] 15s 快存失败，返回 TOS 链接 + 后台转存: {seedream_url[:80]}")
-                                        asyncio.create_task(save_media_permanently(seedream_url, "png", client))
-                                        return JSONResponse(status_code=200, content={"data": [{"url": seedream_url}]})
-                                except asyncio.TimeoutError:
-                                    logger.warning(f"[Seedream] 15s 快存超时，返回 TOS 链接 + 后台转存")
-                                    asyncio.create_task(save_media_permanently(seedream_url, "png", client))
-                                    return JSONResponse(status_code=200, content={"data": [{"url": seedream_url}]})
-                                except Exception as e:
-                                    logger.error(f"[Seedream] 快存异常: {traceback.format_exc()}")
-                                    return JSONResponse(status_code=200, content={"data": [{"url": seedream_url}]})
+                                # 直接用 save_media_permanently 下载（内部 120s 超时），不用外层 wait_for 包裹
+                                # BytePlus TOS 从新加坡到国内的传输速度波动大，短超时必然失败
+                                permanent_url = await save_media_permanently(seedream_url, "png", client)
+                                if permanent_url.startswith("/v1/static/media/"):
+                                    logger.info(f"[Seedream] 转存成功: {permanent_url}")
+                                    return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
+                                else:
+                                    logger.error(f"[Seedream] 下载转存失败: {permanent_url[:80]}")
+                                    return _generic_error("Seedream 图片下载失败，请重试", 500)
                             else:
                                 logger.warning(f"[Seedream] data[0].url 无效: {resp_json['data'][0]}")
                                 return _generic_error("Seedream 返回的图片链接无效", 500)
