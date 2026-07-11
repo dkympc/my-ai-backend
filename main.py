@@ -323,16 +323,6 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 REGISTER_INVITE_CODE = os.getenv("REGISTER_INVITE_CODE", "").strip()
 
 def resolve_api_config(user_info: dict):
-    """
-    🆕 解析用户的 API 配置（Key 和 Base URL）。
-
-    逻辑：
-    - custom_api_key == "global" 或 空 → 使用全局 Key（向后兼容）
-    - custom_api_key 是真实 Key → 使用自己的 Key
-    - URL 没填就用全局的 NEW_API_BASE_URL
-
-    返回：{ api_key, api_base, dmx_key, dmx_base }
-    """
     custom_key = (user_info.get("custom_api_key") or "").strip()
     custom_base = (user_info.get("api_base_url") or "").strip()
     dmx_custom_key = (user_info.get("dmx_api_key") or "").strip()
@@ -340,23 +330,27 @@ def resolve_api_config(user_info: dict):
 
     clean = lambda s: "".join(s.split()).replace('"', '').replace("'", "")
 
-    # --- New-API（聊天/生图/工作流）---
-    if custom_key == "global" or not custom_key:
-        # 老用户/管理员/未配置 → 使用全局 Key 和 URL
+    # 聊天/生图拦截
+    if custom_key == "global":
         api_key = NEW_API_KEY
         api_base = NEW_API_BASE_URL
+    elif not custom_key:
+        api_key = ""
+        api_base = ""
     else:
-        # 用户有自己的 Key → 用用户的 Key，URL 没填就用全局的
         api_key = clean(custom_key)
         api_base = custom_base.rstrip("/") if custom_base else NEW_API_BASE_URL
 
-    # --- DMX API（生视频）---
+    # 生视频拦截
     if dmx_custom_key:
         dmx_key = clean(dmx_custom_key)
         dmx_base = dmx_custom_base.rstrip("/") if dmx_custom_base else DMX_API_BASE_URL
-    else:
+    elif custom_key == "global":
         dmx_key = DMX_API_KEY
         dmx_base = DMX_API_BASE_URL
+    else:
+        dmx_key = ""
+        dmx_base = ""
 
     return {
         "api_key": api_key,
@@ -955,8 +949,9 @@ def _save_base64_to_file(base64_str):
         with open(filepath, "wb") as f:
             f.write(base64.b64decode(encoded))
             
-        # （修改后）强行指路到后端的 8000 端口去拿货！
-        return f"http://82.157.193.46:8000/v1/static/media/{filename}"
+        # ★ 使用相对路径：浏览器通过 Next.js 代理 (/v1/* → 后端) 加载图片
+        # 不再硬编码服务器 IP，换 IP 后无需改代码
+        return f"/v1/static/media/{filename}"
     except Exception as e:
         print(f"Base64 提取失败: {e}")
         return base64_str
@@ -1019,12 +1014,13 @@ def _process_sync_data_in_thread(incoming_data, username):
     except Exception as e:
         logger.error(f"拆分同步失败: {e}")
         conn.rollback()
+        raise  # ★ 把异常抛出去，让 sync_user_sessions 能感知失败并返回错误状态给前端
     finally:
         conn.close()
 
 @app.post("/v1/user/sync_sessions", dependencies=[Depends(verify_token)])
 async def sync_user_sessions(request: Request, user_info: dict = Depends(verify_token)):
-    """前台接待员：收到包就立刻扔给后台干活，瞬间释放通道"""
+    """同步用户数据到云端：等待线程完成后返回真实成功/失败状态（不再射后不理）"""
     try:
         incoming_data = await request.json()
     except Exception:
@@ -1032,10 +1028,13 @@ async def sync_user_sessions(request: Request, user_info: dict = Depends(verify_
         
     username = user_info["username"]
     
-    # 🚀 把上面的干苦力函数丢进系统线程池，不阻塞主干道！
-    await asyncio.to_thread(_process_sync_data_in_thread, incoming_data, username)
-        
-    return JSONResponse(content={"message": "数据已在后台排队同步成功"})
+    try:
+        # ★ 等待线程完成，拿到真实结果后再返回（前端据此判断同步成败 + 重试）
+        await asyncio.to_thread(_process_sync_data_in_thread, incoming_data, username)
+        return JSONResponse(content={"status": "ok", "message": "数据同步成功"})
+    except Exception as e:
+        logger.error(f"[Sync Error] 用户 {username} 的数据同步失败: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 # 👆 确保上面那个函数的 return 已经正常结束，并且上面的代码没有留着未闭合的缩进
 
@@ -1254,7 +1253,7 @@ async def save_media_permanently(media_data_or_url: str, ext: str, client: httpx
     file_id = uuid.uuid4().hex
     file_name = f"{file_id}.{ext}"
     file_path = os.path.join(MEDIA_DIR, file_name)
-    permanent_url = f"http://82.157.193.46:8000/v1/static/media/{file_name}"
+    permanent_url = f"/v1/static/media/{file_name}"
     
     try:
         # 场景 A：处理临时外链 (如快手/字节视频、DALL-E图片)
@@ -1503,22 +1502,133 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
         safe_payload["image"] = reference_image
         safe_payload["images"] = [reference_image]
     
-    # ---- 尺寸安全校验：Seedream 必须 ≥ 2K ----
+    # ---- 尺寸安全校验：Seedream 5.0 最低 2K = 2048x2048 (4,194,304 像素) ----
     if requested_model == "seedream5.0":
         try:
             w_str, h_str = safe_payload.get("size", "1024x1024").split("x")
             w, h = int(w_str), int(h_str)
-            if w * h < 3686400:  # 低于 1920x1920 即视为不安全
+            if w * h < 4194304:  # Seedream 5.0 最低 2K: 2048x2048 = 4,194,304
                 safe_fallback = {
-                    "1:1": "1920x1920",
-                    "16:9": "2560x1440",
-                    "9:16": "1440x2560",
-                    "4:3": "2048x1536"
+                    "1:1": "2048x2048",
+                    "16:9": "2736x1538",
+                    "9:16": "1538x2736",
+                    "4:3": "2364x1774",
+                    "3:4": "1774x2364",
+                    "21:9": "3136x1344"
                 }.get(target_ratio, "2048x2048")
                 logger.warning(f"⚠️ Seedream 尺寸 {safe_payload['size']} 过小，自动提升为 {safe_fallback}")
                 safe_payload["size"] = safe_fallback
         except Exception:
             pass  # 解析失败不处理
+    
+    # ==========================================
+    # 🍌 Banana Pro (Gemini) 专属路由：原生 Gemini generateContent 端点
+    # 说明：banana-pro 的 API 端点与格式完全不同于 OpenAI 格式，必须走 Gemini 原生协议
+    # 端点：POST /v1beta/models/gemini-3-pro-image-preview:generateContent
+    # 格式：{ contents: [{ parts: [...] }], generationConfig: { imageConfig: { aspectRatio, imageSize } } }
+    # ==========================================
+    if requested_model == "banana-pro":
+        logger.info("🍌 触发 Banana Pro (Gemini) 模式，走原生 generateContent 端点")
+        
+        # 从请求中提取 Gemini 专属参数：aspectRatio（如 "16:9"） + imageSize（如 "2K"）
+        gemini_ratio = payload.get("aspectRatio") or target_ratio
+        gemini_size = payload.get("imageSize") or "1K"
+        
+        # 构建 Gemini contents.parts 数组：第一个必须是 text（提示词）
+        gemini_parts = [{"text": prompt_text}]
+        
+        # 🔄 图生图场景：将参考图下载并转为 base64 inlineData，追加到 parts 数组
+        if reference_images:
+            for img_url in reference_images:
+                try:
+                    if img_url.startswith("http"):
+                        dl_resp = await request.app.state.http_client.get(img_url, timeout=30.0)
+                        if dl_resp.status_code == 200:
+                            img_b64 = base64.b64encode(dl_resp.content).decode()
+                            ct = dl_resp.headers.get("content-type", "image/png")
+                            gemini_parts.append({"inlineData": {"mimeType": ct, "data": img_b64}})
+                    elif img_url.startswith("data:"):
+                        header, encoded_data = img_url.split(",", 1)
+                        mime = "image/png"
+                        if "jpeg" in header or "jpg" in header:
+                            mime = "image/jpeg"
+                        elif "webp" in header:
+                            mime = "image/webp"
+                        gemini_parts.append({"inlineData": {"mimeType": mime, "data": encoded_data}})
+                    elif img_url.startswith("/v1/static/media/"):
+                        file_name = img_url.split("/")[-1]
+                        file_path = os.path.join(MEDIA_DIR, file_name)
+                        async with aiofiles.open(file_path, "rb") as f:
+                            file_content = await f.read()
+                        img_b64 = base64.b64encode(file_content).decode()
+                        gemini_parts.append({"inlineData": {"mimeType": "image/png", "data": img_b64}})
+                except Exception as e:
+                    logger.warning(f"🍌 Banana Pro 参考图处理失败: {e}")
+        
+        # 组装 Gemini 原生请求体
+        gemini_payload = {
+            "contents": [{"parts": gemini_parts}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "imageConfig": {
+                    "aspectRatio": gemini_ratio,
+                    "imageSize": gemini_size
+                }
+            }
+        }
+        
+        logger.info(f"🍌 Gemini Payload: aspectRatio={gemini_ratio}, imageSize={gemini_size}, parts_count={len(gemini_parts)}")
+        
+        # 发送到 Gemini 专属端点（非 /v1/images/generations）
+        gemini_url = f"{actual_api_base}/v1beta/models/gemini-3-pro-image-preview:generateContent"
+        client: httpx.AsyncClient = request.app.state.http_client
+        try:
+            gemini_resp = await client.post(
+                gemini_url,
+                headers=_build_upstream_headers(actual_api_key, False),
+                json=gemini_payload,
+                timeout=300.0
+            )
+            logger.info(f"🍌 Gemini 响应: HTTP {gemini_resp.status_code}")
+            
+            if gemini_resp.status_code != 200:
+                return _generic_error(f"Banana Pro 生图失败 (HTTP {gemini_resp.status_code}): {gemini_resp.text[:500]}", 502)
+            
+            result = gemini_resp.json()
+            # 解析 Gemini 响应格式（兼容两种上游返回方式）
+            img_data = None
+            is_raw_base64 = False  # 标记是否为纯 base64（需补 data: 前缀）
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                for part in parts:
+                    # 方式1：inlineData.data（Gemini 原生纯 base64）
+                    if "inlineData" in part and part["inlineData"].get("data"):
+                        img_data = part["inlineData"]["data"]
+                        is_raw_base64 = True
+                        break
+                    # 方式2：text 字段内含 Markdown base64 图片（代理站兼容格式）
+                    if "text" in part:
+                        text = part["text"]
+                        match = re.search(r'!\[.*?\]\((data:image/\w+;base64,[^)]+)\)', text)
+                        if match:
+                            img_data = match.group(1)  # 完整 data URL，无需补前缀
+                            break
+            
+            if img_data:
+                if is_raw_base64:
+                    # 纯 base64 → 补 data: 前缀后持久化
+                    permanent_url = await save_media_permanently(f"data:image/png;base64,{img_data}", "png", client)
+                else:
+                    # 已是完整 data URL（含 data:image/...;base64, 前缀）→ 直接持久化
+                    permanent_url = await save_media_permanently(img_data, "png", client)
+                return JSONResponse(status_code=200, content={"data": [{"url": permanent_url}]})
+            else:
+                return _generic_error("Banana Pro 未返回图片数据", 500)
+        except Exception as e:
+            logger.error(f"🍌 Banana Pro 异常: {traceback.format_exc()}")
+            return _generic_error(f"Banana Pro 请求异常: {str(e)}", 500)
+    # ==========================================
 
     client: httpx.AsyncClient = request.app.state.http_client
     candidate_models = ["gpt-image-2-all", "gpt-image-2", "gpt-image-2-vip"] if requested_model == "gpt-image-2" else [IMAGE_MODEL_MAPPING.get(requested_model, requested_model)]
