@@ -330,24 +330,18 @@ def resolve_api_config(user_info: dict):
 
     clean = lambda s: "".join(s.split()).replace('"', '').replace("'", "")
 
-    # 聊天/生图拦截
-    if custom_key == "global":
-        api_key = NEW_API_KEY
-        api_base = NEW_API_BASE_URL
-    elif not custom_key:
+    # 聊天/生图：不再用服务端 Key 兜底，用户必须配置自己的 Key 才能使用
+    if not custom_key or custom_key == "global":
         api_key = ""
         api_base = ""
     else:
         api_key = clean(custom_key)
         api_base = custom_base.rstrip("/") if custom_base else NEW_API_BASE_URL
 
-    # 生视频拦截
-    if dmx_custom_key:
+    # 生视频：不再用服务端 Key 兜底
+    if dmx_custom_key and dmx_custom_key != "global":
         dmx_key = clean(dmx_custom_key)
         dmx_base = dmx_custom_base.rstrip("/") if dmx_custom_base else DMX_API_BASE_URL
-    elif custom_key == "global":
-        dmx_key = DMX_API_KEY
-        dmx_base = DMX_API_BASE_URL
     else:
         dmx_key = ""
         dmx_base = ""
@@ -1151,12 +1145,19 @@ async def chat_completions(request: Request, user_info: dict = Depends(verify_to
     actual_api_key = api_config["api_key"]
     actual_api_base = api_config["api_base"]
     
+    # 🚨 用户未配置 Key 时直接拒绝（不再用服务端 Key 兜底）
+    if not actual_api_key:
+        return _generic_error("您尚未配置 AI API Key，请在设置 → API 配置中填入您的中转站 Key", 400)
     try: payload = await request.json()
     except Exception: return _generic_error("Invalid JSON", 400)
 
     requested_model = payload.get("model")
     payload["model"] = requested_model if requested_model in ALLOWED_MODELS else DEFAULT_MODEL
     is_stream = bool(payload.get("stream", False))
+    
+    # 🔍 诊断日志：标记请求来源（chat / canvas），追踪 Key 配置状态
+    source = payload.pop("_source", "chat")
+    logger.info(f"[DIAG][{source}] model={requested_model} | key_set={'YES' if actual_api_key else 'NO'} | base={actual_api_base[:40]}...")
     
     # ✨ 提取出前端传来的搜索参数，防止引起原生大模型报错
     is_search = payload.pop("search", False)
@@ -2166,6 +2167,10 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
         api_config = resolve_api_config(user_info)
         actual_api_key = api_config["api_key"]
         actual_api_base = api_config["api_base"]
+
+        # 🚨 用户未配置 Key 时直接拒绝（不再用服务端 Key 兜底）
+        if not actual_api_key:
+            return _generic_error("您尚未配置 AI API Key，请在设置 → API 配置中填入您的中转站 Key", 400)
 
         client: httpx.AsyncClient = request.app.state.http_client
         try:
