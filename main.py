@@ -793,7 +793,13 @@ async def list_invite_codes():
 
 @app.post("/v1/user/heartbeat", dependencies=[Depends(verify_token)])
 async def user_heartbeat(user_info: dict = Depends(verify_token)):
-    """接收前端心跳，仅做连接监测，不写入数据库（减少写入压力）"""
+    """接收前端心跳，更新 last_active_at 时间戳用于在线状态判定"""
+    username = user_info["username"]
+    now_ts = int(datetime.utcnow().timestamp())
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET last_active_at = ? WHERE username = ?", (now_ts, username))
+    conn.commit()
+    conn.close()
     return JSONResponse(content={"status": "alive"})
 
 # 🆕 新增：用户修改密码
