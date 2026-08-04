@@ -387,8 +387,15 @@ async def lifespan(app: FastAPI):
     # 🚀 强制底层网络使用 IPv4，防止 Docker 内网傻等 IPv6 解析超时
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
     # 这里初始化一个全局的 client，其他所有接口都在用它
+    # ★ 超时拆细：读超时 15 分钟（匹配前端 8 分钟 + 余量），防裂变分镜等长流式响应被截断
+    #   旧配置 httpx.Timeout(300.0) 对所有操作一视同仁，长流式响应超过 5 分钟即报 ReadError → 前端 500
     app.state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(300.0), # 给等待画图/视频的时间设置 5 分钟上限
+        timeout=httpx.Timeout(
+            connect=30.0,   # 连接超时：30 秒足够
+            read=900.0,     # 读取超时：15 分钟，给长流式响应充分时间（裂变分镜可达 8-10 分钟）
+            write=60.0,     # 写入超时：60 秒（请求体通常不大）
+            pool=30.0       # 连接池超时：30 秒
+        ),
         trust_env=False,
         transport=transport
     )
@@ -1234,11 +1241,20 @@ async def chat_completions(request: Request, user_info: dict = Depends(verify_to
 
         if is_stream:
             async def stream_generator():
+                bytes_sent = 0
                 try:
                     async for chunk in upstream_response.aiter_bytes(32):
                         if chunk:
                             yield chunk
-                            await asyncio.sleep(0.001) 
+                            bytes_sent += len(chunk)
+                            await asyncio.sleep(0.001)
+                except Exception as read_err:
+                    # ★ 流式读取中断（上游超时/断连/ReadError），不要炸成 ASGI 500
+                    #   已发送部分数据给前端，优雅结束流，前端自行处理不完整响应
+                    logger.warning(f"[Chat Stream Interrupted] 已发送 {bytes_sent} 字节后流中断 | 模型={requested_model} | 用户={user_info['username']} | 错误={read_err}")
+                    # 注入一条 SSE error 事件告知前端流被截断（前端可据此判定响应不完整）
+                    error_event = json.dumps({"error": f"上游流中断: {str(read_err)}", "bytes_received": bytes_sent}, ensure_ascii=False)
+                    yield f"data: {error_event}\n\n".encode("utf-8")
                 finally:
                     if not upstream_response.is_closed: await upstream_response.aclose()
             resp_headers = _safe_headers(upstream_response.headers)
@@ -2195,11 +2211,18 @@ async def workflows_run(request: Request, user_info: dict = Depends(verify_token
                 return Response(content=content, status_code=upstream_response.status_code)
 
             async def stream_generator():
+                bytes_sent = 0
                 try:
                     async for chunk in upstream_response.aiter_bytes(32):
                         if chunk:
                             yield chunk
+                            bytes_sent += len(chunk)
                             await asyncio.sleep(0.001)
+                except Exception as read_err:
+                    # ★ 流式读取中断（上游超时/断连/ReadError），不要炸成 ASGI 500
+                    logger.warning(f"[Workflow Stream Interrupted] 已发送 {bytes_sent} 字节后流中断 | 错误={read_err}")
+                    error_event = json.dumps({"error": f"上游流中断: {str(read_err)}", "bytes_received": bytes_sent}, ensure_ascii=False)
+                    yield f"data: {error_event}\n\n".encode("utf-8")
                 finally:
                     if not upstream_response.is_closed: await upstream_response.aclose()
 
