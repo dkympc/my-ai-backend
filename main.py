@@ -75,7 +75,10 @@ import io
 from fastapi.staticfiles import StaticFiles
 
 # --- 自动加载本地 .env 文件 ---
-load_dotenv() 
+load_dotenv()
+
+# ★ 画布提示词仓库（安全：提示词原文不暴露给浏览器）
+from canvas_prompts import CANVAS_PROMPTS
 
 logger = logging.getLogger("ai_backend")
 logging.basicConfig(level=logging.INFO)
@@ -2247,6 +2250,161 @@ async def get_static_media(filename: str):
     if os.path.exists(file_path):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="图片未找到")
+
+# ==============================
+# 🎨 画布提示词安全代理（核心 IP 保护）
+# ==============================
+# 安全设计动机：
+#   前端所有 .ts/.tsx 文件都会被 Next.js 打包为 JS 并发送到浏览器，
+#   任何硬编码在前端的 System Prompt 都可以通过 F12 开发者工具外泄。
+#   因此，所有画布核心提示词（分镜裂变/资产提取/摄影机配置等）迁移到此后端端点，
+#   前端只传 prompt_type（代号）和 params（动态数据），
+#   提示词原文永远留在服务器内存中，不经过 HTTP 响应返回给浏览器。
+#
+# 占位符格式：%%VARIABLE_NAME%%（在 canvas_prompts.py 中定义，运行时替换）
+#   这个格式与中英文文本、JSON、代码块中的任何字符都不冲突。
+
+def _fill_prompt_template(template: str, params: dict) -> str:
+    """用 params 字典中的值替换模板中的 %%VAR%% 占位符"""
+    result = template
+    for key, value in params.items():
+        placeholder = f"%%{key}%%"
+        result = result.replace(placeholder, str(value))
+    return result
+
+
+@app.post("/v1/canvas/prompt")
+async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify_token)):
+    """
+    画布提示词安全代理。
+    前端发送 prompt_type + params + user_content，
+    后端查找对应模板、填入动态参数、构造完整 messages 数组，
+    然后复用与 /v1/chat/completions 相同的上游调用逻辑。
+    
+    返回格式：与 /v1/chat/completions 完全一致（SSE 流式 或 JSON 非流式）。
+    """
+    # 1️⃣ 权限校验：画布功能也需要聊天权限
+    if not user_info.get("allow_chat", True):
+        raise HTTPException(status_code=403, detail="抱歉，您的账号未开通 [智能对话] 权限，请联系管理员。")
+
+    # 2️⃣ 扣费
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET tokens_used = tokens_used + 150 WHERE username = ?", (user_info["username"],))
+    conn.commit()
+    conn.close()
+
+    # 3️⃣ API Key 路由
+    api_config = resolve_api_config(user_info)
+    actual_api_key = api_config["api_key"]
+    actual_api_base = api_config["api_base"]
+    if not actual_api_key:
+        return _generic_error("您尚未配置 AI API Key，请在设置 → API 配置中填入您的中转站 Key", 400)
+
+    # 4️⃣ 解析前端请求
+    try:
+        payload = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+
+    prompt_type = payload.get("prompt_type", "")
+    template_params = payload.get("params", {})
+
+    # 5️⃣ 从提示词仓库取出模板，填入动态参数
+    template = CANVAS_PROMPTS.get(prompt_type)
+    if not template:
+        return _generic_error(f"未知的提示词类型: {prompt_type}", 400)
+
+    # 特殊处理：fission-stage1 需要自动计算 next_shot_start + 1
+    if "NEXT_SHOT_START" in template_params:
+        ns = template_params["NEXT_SHOT_START"]
+        if isinstance(ns, int):
+            template_params["NEXT_SHOT_PLUS_1"] = ns + 1
+
+    system_content = _fill_prompt_template(template, template_params)
+
+    # 6️⃣ 构造 user message
+    user_content = payload.get("user_content", "")
+    if isinstance(user_content, list):
+        # 支持多模态格式（预留扩展）
+        user_message = user_content
+    else:
+        user_message = str(user_content)
+
+    # 7️⃣ 模型选择
+    requested_model = payload.get("model")
+    model = requested_model if requested_model in ALLOWED_MODELS else DEFAULT_MODEL
+
+    # 8️⃣ 构造上游请求
+    is_stream = bool(payload.get("stream", True))
+    upstream_payload = {
+        "model": model,
+        "stream": is_stream,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_message},
+        ],
+    }
+
+    # 透传可选参数（thinking, max_tokens 等）
+    for key in ("thinking", "max_tokens", "temperature", "top_p"):
+        if key in payload:
+            upstream_payload[key] = payload[key]
+
+    # 9️⃣ 诊断日志
+    logger.info(f"[DIAG][canvas-prompt] type={prompt_type} | model={model} | user={user_info['username']} | params_keys={list(template_params.keys())}")
+    # ★ 诊断：确认真实发给上游的 thinking 字段值
+    logger.info(f"[DIAG][canvas-prompt-upstream] thinking={upstream_payload.get('thinking', 'NOT IN PAYLOAD')}")
+
+    # 🔟 调用上游 API（复用与 chat_completions 相同的调用逻辑）
+    client: httpx.AsyncClient = request.app.state.http_client
+    try:
+        upstream_request = client.build_request(
+            "POST",
+            f"{actual_api_base}/v1/chat/completions",
+            headers=_build_upstream_headers(actual_api_key, is_stream),
+            json=upstream_payload,
+        )
+        upstream_response = await client.send(upstream_request, stream=True)
+
+        if upstream_response.status_code >= 400:
+            error_body = await upstream_response.aread()
+            await upstream_response.aclose()
+            return _generic_error(f"上游网关拦截 ({upstream_response.status_code})，真实报错内容: {error_body.decode('utf-8', errors='ignore')}", 500)
+
+        if is_stream:
+            async def stream_generator():
+                bytes_sent = 0
+                try:
+                    async for chunk in upstream_response.aiter_bytes(32):
+                        if chunk:
+                            yield chunk
+                            bytes_sent += len(chunk)
+                            await asyncio.sleep(0.001)
+                except Exception as read_err:
+                    logger.warning(f"[Canvas Prompt Stream Interrupted] 已发送 {bytes_sent} 字节后流中断 | type={prompt_type} | 模型={model} | 用户={user_info['username']} | 错误={read_err}")
+                    error_event = json.dumps({"error": f"上游流中断: {str(read_err)}", "bytes_received": bytes_sent}, ensure_ascii=False)
+                    yield f"data: {error_event}\n\n".encode("utf-8")
+                finally:
+                    if not upstream_response.is_closed:
+                        await upstream_response.aclose()
+
+            resp_headers = _safe_headers(upstream_response.headers)
+            resp_headers.update({
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            })
+            return StreamingResponse(stream_generator(), status_code=upstream_response.status_code, headers=resp_headers)
+
+        # 非流式：直接返回完整响应
+        content = await upstream_response.aread()
+        await upstream_response.aclose()
+        return Response(content=content, status_code=200, media_type="application/json")
+
+    except Exception as e:
+        return _generic_error(f"[Canvas Prompt Error] - 原因是：{str(e)}", 500)
+
 
 if __name__ == "__main__":
     import uvicorn
