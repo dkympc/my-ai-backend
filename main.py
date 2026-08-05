@@ -7,7 +7,7 @@ RMB_TO_TOKEN = 100000
 def calculate_image_cost(model: str) -> int:
     """生图按次精准计费"""
     cost_rmb = 0.1 # 默认普通模型 0.1 元/张
-    if model in ["banana-pro", "seedream5.0"]: 
+    if model in ["banana-pro", "seedream5.0", "seedream-5-0-pro-260628"]: 
         cost_rmb = 0.15 # 高级模型 0.15 元/张
     return int(cost_rmb * RMB_TO_TOKEN)
 
@@ -358,15 +358,19 @@ def resolve_api_config(user_info: dict):
 
 ALLOWED_MODELS = [
     "gpt-5.4", 
+    "gemini-3.6-flash",
     "gemini-3.5-flash", 
     "gemini-3.1-pro-preview",
     "deepseek-v4-pro",
+    "kimi-k2.6",
+    "claude-haiku-4-5-20251001-thinking",
 ]
 
 ALLOWED_IMAGE_MODELS = [
     "gpt-image-2", 
     "banana-pro", 
-    "seedream5.0"
+    "seedream5.0",
+    "seedream-5-0-pro-260628"
 ]
 
 # 修改 IMAGE_MODEL_MAPPING
@@ -378,6 +382,7 @@ IMAGE_MODEL_MAPPING = {
 ALLOWED_VIDEO_MODELS = [
     "doubao-seedance-2-0-fast-260128",
     "doubao-seedance-2-0-260128",
+    "seedance-2.5",
     "kling-o3"
 ]
 
@@ -1483,11 +1488,12 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
 
     # ==========================================
 
-    elif requested_model == "seedream5.0" and reference_images:
-        logger.info("🚀 触发 Seedream 5.0 图编辑 (去脏重绘) 模式，无损透传 URL 数组")
+    elif (requested_model == "seedream5.0" or requested_model == "seedream-5-0-pro-260628") and reference_images:
+        logger.info("🚀 触发 Seedream 图编辑 (去脏重绘) 模式，无损透传 URL 数组")
         # 格式化 safe_payload 为火山标准
+        seedream_api_model = "seedream-5-0-pro-260628" if requested_model == "seedream-5-0-pro-260628" else "seedream-5-0-260128"
         safe_payload = {
-            "model": "seedream-5-0-260128",
+            "model": seedream_api_model,
             "prompt": prompt_text,
             "image": reference_images,  # 火山格式：URL 数组，不支持二进制
             "sequential_image_generation": "disabled",
@@ -1511,7 +1517,7 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
         }
 
     # ---- seedream 专属参数 ----
-    if requested_model == "seedream5.0":
+    if requested_model in ("seedream5.0", "seedream-5-0-pro-260628"):
         safe_payload["output_format"] = "png"
 
     # ---- banana 系列专属 ----
@@ -1528,8 +1534,8 @@ async def image_generations(request: Request, user_info: dict = Depends(verify_t
         safe_payload["image"] = reference_image
         safe_payload["images"] = [reference_image]
     
-    # ---- 尺寸安全校验：Seedream 5.0 最低 2K = 2048x2048 (4,194,304 像素) ----
-    if requested_model == "seedream5.0":
+    # ---- 尺寸安全校验：Seedream 最低 2K = 2048x2048 (4,194,304 像素) ----
+    if requested_model in ("seedream5.0", "seedream-5-0-pro-260628"):
         try:
             w_str, h_str = safe_payload.get("size", "1024x1024").split("x")
             w, h = int(w_str), int(h_str)
