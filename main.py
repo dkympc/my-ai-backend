@@ -2360,16 +2360,16 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
         ],
     }
 
-    # 透传可选参数（thinking, max_tokens, reasoning_effort 等）
-    for key in ("thinking", "max_tokens", "temperature", "top_p", "reasoning_effort"):
+    # 透传可选参数（thinking, max_tokens, temperature, top_p 等）
+    for key in ("thinking", "max_tokens", "temperature", "top_p"):
         if key in payload:
             upstream_payload[key] = payload[key]
 
-    # ★ "不设上限"策略：分镜类请求不限制 max_tokens，让 LLM 有多少输出多少
-    # 前端不设 max_tokens 时，若 API 默认值过小（如 4096），长剧本只能出 1-2 个分镜
-    # 此处强制设 65536，保证即使前端未传，上游也有足够的 token 预算
-    if prompt_type in ("fission-stage1", "fission-stage2") and "max_tokens" not in upstream_payload:
-        upstream_payload["max_tokens"] = 65536
+    # ★ "不设上限"策略：分镜类请求完全不传 max_tokens 参数
+    # 让模型自行决定输出长度，避免 65536 限制触发 GPT/Kimi 超长推理导致卡死
+    # 如果上游 API 默认值过小，由 NewAPI/中转站侧的模型配置兜底
+    if prompt_type in ("fission-stage1", "fission-stage2") and "max_tokens" in upstream_payload:
+        upstream_payload.pop("max_tokens", None)
 
     # 9️⃣ 诊断日志
     logger.info(f"[DIAG][canvas-prompt] type={prompt_type} | model={model} | user={user_info['username']} | params_keys={list(template_params.keys())}")
