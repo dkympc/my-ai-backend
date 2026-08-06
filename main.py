@@ -1014,16 +1014,24 @@ def _process_sync_data_in_thread(incoming_data, username):
                 placeholders = ','.join(['?' for _ in incoming_ids])
                 conn.execute(f"DELETE FROM {table_name} WHERE username = ? AND id NOT IN ({placeholders})",
                              (username, *incoming_ids))
-            else:
-                # 传入空数组 → 删除该用户该表的所有行
-                conn.execute(f"DELETE FROM {table_name} WHERE username = ?", (username,))
+            # ★ Bug N 修复：空数组不再触发全表 DELETE！
+            # 空 canvasProjects 通常是前端数据尚未加载完成时的默认值 []，
+            # 此时执行 DELETE FROM canvas_projects WHERE username=? 会把云端数据永久删除。
+            # 现在空数组 = 无操作（不删、不写、不覆盖），仅非空数组才同步。
 
         # 4. 分发到各表
         sync_array("chat_sessions", processed_data.get("sessions", []))
         sync_array("image_history", processed_data.get("imageHistory", []))
         sync_array("video_history", processed_data.get("videoHistory", []))
         sync_array("wf_sessions", processed_data.get("wfSessions", []))
-        sync_array("canvas_projects", processed_data.get("canvasProjects", []))
+        # ★ Bug O 修复：过滤掉 stripped 画布项目（只有 id/title/updatedAt，无 nodes/edges）
+        # 这类项目来自 sessionStorage 水合或前端数据未就绪时的默认状态，
+        # 若 INSERT OR REPLACE 进数据库会覆盖掉完整的云端数据（含 nodes/edges/script）
+        raw_canvas = processed_data.get("canvasProjects", [])
+        clean_canvas = [p for p in raw_canvas if isinstance(p, dict) and p.get("nodes")]
+        if len(clean_canvas) != len(raw_canvas):
+            logger.info(f"[Bug O 防护] 过滤了 {len(raw_canvas) - len(clean_canvas)} 个无 nodes 的 stripped 画布项目")
+        sync_array("canvas_projects", clean_canvas)
         
         conn.commit()
     except Exception as e:
@@ -2355,6 +2363,12 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
     for key in ("thinking", "max_tokens", "temperature", "top_p"):
         if key in payload:
             upstream_payload[key] = payload[key]
+
+    # ★ "不设上限"策略：分镜类请求不限制 max_tokens，让 LLM 有多少输出多少
+    # 前端不设 max_tokens 时，若 API 默认值过小（如 4096），长剧本只能出 1-2 个分镜
+    # 此处强制设 65536，保证即使前端未传，上游也有足够的 token 预算
+    if prompt_type in ("fission-stage1", "fission-stage2") and "max_tokens" not in upstream_payload:
+        upstream_payload["max_tokens"] = 65536
 
     # 9️⃣ 诊断日志
     logger.info(f"[DIAG][canvas-prompt] type={prompt_type} | model={model} | user={user_info['username']} | params_keys={list(template_params.keys())}")
