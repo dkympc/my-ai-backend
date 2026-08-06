@@ -10,6 +10,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
 COPY main.py /app/main.py
+COPY canvas_prompts.py /app/canvas_prompts.py
 
 EXPOSE 8000
 

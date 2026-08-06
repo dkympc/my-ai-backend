@@ -384,23 +384,6 @@ PROMPT_FISSION_STAGE1 = """你是一名大师级分镜师兼 AI 提示词专家�
 - dialogueRequirements: ★ 对白要求（有对白时必填，无对白则省略此字段）。以角色为单位，用自然中文描述每句对白的语气层次、情绪递进、语速变化、声音质感、气息控制。可以引用参考风格标签（如"低沉沙哑、气息不连贯"、"痞气、语速快、带嘴碎感"）。目的是让后续音频或视频模型准确理解台词的表演方向，不只是念字。
 
 ═══════════════════════════════════════
-【全局画面约束 — 注入到每一条生图/生视频 Prompt 尾部】
-═══════════════════════════════════════
-
-你生成的每一条首帧图 Prompt 和视频 Prompt，尾部必须强制拼接以下约束：
-
-【通用基础约束（英文，直接拼接到 Prompt 末尾）】：
-Photorealistic film still look, cinematic lighting. Not 3D render, not CGI, not anime. No subtitles, no watermark. Organic film noise.
-
-【禁止项 — 绝对不能在 Prompt 中出现以下内容】：
-字幕、BGM、人物滤镜、完美人物、画面闪烁、人物漂移、手部畸形。
-
-【角色肤质约束（中文，拼接在通用基础约束之后）】：
-粗糙皮肤，可见毛孔，细微绒毛，皮肤瑕疵，明显细纹，1:1真实肤色。
-
-注意：shotLighting 和 cameraRules 正常拼接，以上约束追加在最后，不干扰光影和机位参数。
-
-═══════════════════════════════════════
 【完整示例参考 ① — 青铜工坊：暮色机械美学（单人 / 横摇推镜 / 3/4斜侧固定 / Rack Focus）】
 ═══════════════════════════════════════
 
@@ -913,7 +896,7 @@ shotLighting 为：
 ```json
 {
   "imagePrompts": [
-    "3/4斜侧中景镜头，固定机位——摄影机位于老匠人右前方约45度。侧面暖色硬光从窄窗斜射入画。昏暗青铜工坊内，佝偻着背坐在堆满泛黄羊皮图纸的厚重松木工作台后方的老匠人，身体前倾，右手中铜镊子正搁向台面——镊子尖端与松木桌面接触前约一厘米的悬停瞬间，额头上被斜阳照得纹路纤毫毕现，机械臂上的铜锈泛起暗沉的哑光。warm golden-hour side light from narrow window, deep shadow on the opposite wall, volumetric dust particles suspended in a single diagonal beam. Photorealistic film still look, cinematic lighting. Not 3D render, not CGI, not anime. No subtitles, no watermark. Organic film noise. 粗糙皮肤，可见毛孔，细微绒毛，皮肤瑕疵，明显细纹，1:1真实肤色。"
+    "3/4斜侧中景镜头，固定机位——摄影机位于老匠人右前方约45度。侧面暖色硬光从窄窗斜射入画。昏暗青铜工坊内，佝偻着背坐在堆满泛黄羊皮图纸的厚重松木工作台后方的老匠人，身体前倾，右手中铜镊子正搁向台面——镊子尖端与松木桌面接触前约一厘米的悬停瞬间，额头上被斜阳照得纹路纤毫毕现，机械臂上的铜锈泛起暗沉的哑光。warm golden-hour side light from narrow window, deep shadow on the opposite wall, volumetric dust particles suspended in a single diagonal beam."
   ]
 }
 ```
@@ -923,8 +906,6 @@ shotLighting 为：
 - 场景"昏暗青铜工坊...老匠人佝偻着背坐在...工作台后方"来自 spatialLayout
 - 光源"侧面暖色硬光从窄窗斜射入画"来自 shotLighting 的中文翻译
 - 最后一段英文为 shotLighting 的完整原文照抄
-- 末尾的 Photorealistic / No subtitles / No watermark 等为【全局基础约束】（Stage 1 已注入），直接沿用到每条首帧 Prompt 尾部
-- 末尾的中文联为【角色肤质约束】（Stage 1 已注入），同上直接沿用
 - 没有臆造任何 spatialLayout 中没有的光源、道具或人物站位"""
 
 
