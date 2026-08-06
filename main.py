@@ -2359,8 +2359,8 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
         ],
     }
 
-    # 透传可选参数（thinking, max_tokens 等）
-    for key in ("thinking", "max_tokens", "temperature", "top_p"):
+    # 透传可选参数（thinking, max_tokens, reasoning_effort 等）
+    for key in ("thinking", "max_tokens", "temperature", "top_p", "reasoning_effort"):
         if key in payload:
             upstream_payload[key] = payload[key]
 
@@ -2373,7 +2373,7 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
     # 9️⃣ 诊断日志
     logger.info(f"[DIAG][canvas-prompt] type={prompt_type} | model={model} | user={user_info['username']} | params_keys={list(template_params.keys())}")
     # ★ 诊断：确认真实发给上游的 thinking 字段值
-    logger.info(f"[DIAG][canvas-prompt-upstream] thinking={upstream_payload.get('thinking', 'NOT IN PAYLOAD')}")
+    logger.info(f"[DIAG][canvas-prompt-upstream] thinking={upstream_payload.get('thinking', 'NOT IN PAYLOAD')} | max_tokens={upstream_payload.get('max_tokens', 'NOT SET')} | stream={is_stream} | system_len={len(system_content)} | user_len={len(str(user_message))} | api_base={actual_api_base}")
 
     # 🔟 调用上游 API（复用与 chat_completions 相同的调用逻辑）
     client: httpx.AsyncClient = request.app.state.http_client
@@ -2385,18 +2385,25 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
             json=upstream_payload,
         )
         upstream_response = await client.send(upstream_request, stream=True)
+        logger.info(f"[DIAG][canvas-prompt-upstream-resp] status={upstream_response.status_code} | content_type={upstream_response.headers.get('content-type', 'N/A')}")
 
         if upstream_response.status_code >= 400:
             error_body = await upstream_response.aread()
             await upstream_response.aclose()
-            return _generic_error(f"上游网关拦截 ({upstream_response.status_code})，真实报错内容: {error_body.decode('utf-8', errors='ignore')}", 500)
+            error_text = error_body.decode('utf-8', errors='ignore')
+            logger.error(f"[DIAG][canvas-prompt-upstream-err] status={upstream_response.status_code} | body={error_text[:500]}")
+            return _generic_error(f"上游网关拦截 ({upstream_response.status_code})，真实报错内容: {error_text}", 500)
 
         if is_stream:
             async def stream_generator():
                 bytes_sent = 0
+                first_chunk_logged = False
                 try:
                     async for chunk in upstream_response.aiter_bytes(32):
                         if chunk:
+                            if not first_chunk_logged:
+                                logger.info(f"[DIAG][canvas-prompt-first-chunk] 收到首个SSE块 | bytes={len(chunk)} | raw={chunk.decode('utf-8', errors='ignore')[:300]}")
+                                first_chunk_logged = True
                             yield chunk
                             bytes_sent += len(chunk)
                             await asyncio.sleep(0.001)
@@ -2405,6 +2412,7 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
                     error_event = json.dumps({"error": f"上游流中断: {str(read_err)}", "bytes_received": bytes_sent}, ensure_ascii=False)
                     yield f"data: {error_event}\n\n".encode("utf-8")
                 finally:
+                    logger.info(f"[DIAG][canvas-prompt-stream-end] 流结束 | total_bytes={bytes_sent} | model={model}")
                     if not upstream_response.is_closed:
                         await upstream_response.aclose()
 
