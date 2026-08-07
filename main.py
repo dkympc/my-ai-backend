@@ -2337,6 +2337,10 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
 
     system_content = _fill_prompt_template(template, template_params)
 
+    # ★ 全景图等纯提示词获取模式：raw=true 时直接返回模板文本，不走 LLM
+    if payload.get("raw", False):
+        return {"prompt": system_content, "prompt_type": prompt_type}
+
     # 6️⃣ 构造 user message
     user_content = payload.get("user_content", "")
     if isinstance(user_content, list):
