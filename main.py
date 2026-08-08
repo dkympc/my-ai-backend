@@ -2364,21 +2364,31 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
         ],
     }
 
-    # 透传可选参数（thinking, max_tokens, temperature, top_p 等）
-    for key in ("thinking", "max_tokens", "temperature", "top_p"):
+    # 透传可选参数（thinking, max_tokens, temperature, top_p, reasoning_effort 等）
+    for key in ("thinking", "max_tokens", "temperature", "top_p", "reasoning_effort"):
         if key in payload:
             upstream_payload[key] = payload[key]
 
-    # ★ "不设上限"策略：分镜类请求完全不传 max_tokens 参数
-    # 让模型自行决定输出长度，避免 65536 限制触发 GPT/Kimi 超长推理导致卡死
-    # 如果上游 API 默认值过小，由 NewAPI/中转站侧的模型配置兜底
-    if prompt_type in ("fission-stage1", "fission-stage2") and "max_tokens" in upstream_payload:
-        upstream_payload.pop("max_tokens", None)
+    # ★ max_tokens 策略（分阶段）：
+    # - DeepSeek V4：非思考模式下默认 max_tokens 偏低，需前端显式传值，后端放行
+    # - 其他模型：不传 max_tokens，避免高限制触发超长推理导致卡死
+    if prompt_type in ("fission-stage1", "fission-stage2"):
+        if model == "deepseek-v4-pro":
+            if "max_tokens" not in upstream_payload:
+                upstream_payload["max_tokens"] = 65536
+                logger.info(f"[DIAG][canvas-prompt-max_tokens] DeepSeek V4 裂变兜底 max_tokens=65536")
+            else:
+                logger.info(f"[DIAG][canvas-prompt-max_tokens] DeepSeek V4 裂变前端已设 max_tokens={upstream_payload['max_tokens']}，放行")
+        else:
+            if "max_tokens" in upstream_payload:
+                upstream_payload.pop("max_tokens", None)
+                logger.info(f"[DIAG][canvas-prompt-max_tokens] 非 DeepSeek 模型，已剔除 max_tokens")
 
     # 9️⃣ 诊断日志
     logger.info(f"[DIAG][canvas-prompt] type={prompt_type} | model={model} | user={user_info['username']} | params_keys={list(template_params.keys())}")
-    # ★ 诊断：确认真实发给上游的 thinking 字段值
-    logger.info(f"[DIAG][canvas-prompt-upstream] thinking={upstream_payload.get('thinking', 'NOT IN PAYLOAD')} | max_tokens={upstream_payload.get('max_tokens', 'NOT SET')} | stream={is_stream} | system_len={len(system_content)} | user_len={len(str(user_message))} | api_base={actual_api_base}")
+    # ★ 诊断：确认真实发给上游的 thinking 字段值 + 请求内容摘要
+    user_msg_str = str(user_message)
+    logger.info(f"[DIAG][canvas-prompt-upstream] thinking={upstream_payload.get('thinking', 'NOT IN PAYLOAD')} | max_tokens={upstream_payload.get('max_tokens', 'NOT SET')} | stream={is_stream} | system_len={len(system_content)} | user_len={len(user_msg_str)} | user_head={user_msg_str[:200]} | user_tail={user_msg_str[-200:]} | api_base={actual_api_base}")
 
     # 🔟 调用上游 API（复用与 chat_completions 相同的调用逻辑）
     client: httpx.AsyncClient = request.app.state.http_client
@@ -2417,7 +2427,7 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
                     error_event = json.dumps({"error": f"上游流中断: {str(read_err)}", "bytes_received": bytes_sent}, ensure_ascii=False)
                     yield f"data: {error_event}\n\n".encode("utf-8")
                 finally:
-                    logger.info(f"[DIAG][canvas-prompt-stream-end] 流结束 | total_bytes={bytes_sent} | model={model}")
+                    logger.info(f"[DIAG][canvas-prompt-stream-end] 流结束 | total_bytes={bytes_sent} | model={model} | prompt_type={prompt_type} | max_tokens_setting={upstream_payload.get('max_tokens', 'NOT SET')}")
                     if not upstream_response.is_closed:
                         await upstream_response.aclose()
 
