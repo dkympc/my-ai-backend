@@ -2439,6 +2439,99 @@ async def canvas_prompt_proxy(request: Request, user_info: dict = Depends(verify
         return _generic_error(f"[Canvas Prompt Error] - 原因是：{str(e)}", 500)
 
 
+# ============================================================
+# ★★★ Skybox API 代理 — 720° Equirectangular 全景图生成（预留）
+# 上游：Blockade Labs Skybox AI (https://backend.blockadelabs.com/api/v1/skybox)
+# 状态：骨架已就绪，待 Owner 注册 API Key 后启用
+# ============================================================
+@app.post("/v1/skybox/generate")
+async def skybox_generate(request: Request, user_info: dict = Depends(verify_token)):
+    """
+    代理 Blockade Labs Skybox AI，生成 720° equirectangular 全景图。
+    需配置环境变量 SKYBOX_API_KEY。
+    """
+    if not user_info.get("allow_chat", True):
+        raise HTTPException(status_code=403, detail="抱歉，您的账号未开通 [智能对话] 权限，请联系管理员。")
+
+    skybox_api_key = os.getenv("SKYBOX_API_KEY", "")
+    if not skybox_api_key:
+        return _generic_error("[Skybox] 服务未配置 SKYBOX_API_KEY，请联系管理员在 .env 中添加", 503)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return _generic_error("Invalid JSON", 400)
+
+    prompt = payload.get("prompt", "")
+    skybox_style_id = payload.get("skybox_style_id", 155)  # 默认 Open World
+    negative_text = payload.get("negative_text", "")
+    enhance_prompt = payload.get("enhance_prompt", False)
+
+    if not prompt:
+        return _generic_error("[Skybox] prompt 参数不能为空", 400)
+
+    skybox_url = "https://backend.blockadelabs.com/api/v1/skybox"
+    headers = {"x-api-key": skybox_api_key, "Content-Type": "application/json"}
+    body = {
+        "skybox_style_id": skybox_style_id,
+        "prompt": prompt,
+        "negative_text": negative_text,
+        "enhance_prompt": enhance_prompt,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # 发起生成请求
+            gen_resp = await client.post(skybox_url, json=body, headers=headers)
+            if gen_resp.status_code != 200:
+                error_detail = gen_resp.text
+                return _generic_error(f"[Skybox] 生成请求失败: {gen_resp.status_code} - {error_detail}", 502)
+
+            gen_data = gen_resp.json()
+            skybox_id = gen_data.get("id")
+            if not skybox_id:
+                return _generic_error("[Skybox] 未获取到生成 ID", 502)
+
+            # 轮询等待完成
+            poll_url = f"https://backend.blockadelabs.com/api/v1/imagine/requests/{skybox_id}"
+            max_attempts = 30
+            for attempt in range(max_attempts):
+                await asyncio.sleep(3)
+                poll_resp = await client.get(poll_url, headers=headers)
+                if poll_resp.status_code != 200:
+                    continue
+                poll_data = poll_resp.json()
+                status = poll_data.get("request", {}).get("status", "")
+                if status == "complete":
+                    file_url = poll_data.get("request", {}).get("file_url", "")
+                    if file_url:
+                        # 下载并永久化存储
+                        img_resp = await client.get(file_url)
+                        if img_resp.status_code == 200:
+                            filename = f"skybox_{skybox_id}.jpg"
+                            filepath = os.path.join(MEDIA_DIR, filename)
+                            with open(filepath, "wb") as f:
+                                f.write(img_resp.content)
+                            permanent_url = f"{MEDIA_BASE_URL}/{filename}"
+                            return {
+                                "status": "ok",
+                                "url": permanent_url,
+                                "thumb_url": poll_data.get("request", {}).get("thumb_url", ""),
+                                "depth_map_url": poll_data.get("request", {}).get("depth_map_url", ""),
+                            }
+                        else:
+                            return _generic_error("[Skybox] 生成成功但下载图片失败", 502)
+                    return _generic_error("[Skybox] 生成完成但未返回图片 URL", 502)
+                elif status in ("abort", "error"):
+                    err = poll_data.get("request", {}).get("error_message", "未知错误")
+                    return _generic_error(f"[Skybox] 生成失败: {err}", 502)
+
+            return _generic_error("[Skybox] 生成超时（超过 90 秒）", 504)
+
+    except Exception as e:
+        return _generic_error(f"[Skybox Error] - 原因是：{str(e)}", 500)
+
+
 if __name__ == "__main__":
     import uvicorn
     print("YR AI 后端已启动：http://127.0.0.1:8000")

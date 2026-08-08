@@ -737,6 +737,28 @@ PROMPT_PANORAMA_GEN = """Generate a stable ultra-wide panoramic environment plat
 
 
 # ============================================================
+# ⑨ 导演台渲染 — director-stage-render
+# 用于将导演台截图（3D人偶+场景+机位）渲染为最终影视级画面
+# ============================================================
+PROMPT_DIRECTOR_STAGE_RENDER = """You are a professional cinematographer and visual effects supervisor. Your task is to render a final cinematic frame based on a director-stage reference image and user prompt.
+
+The reference image is a rough 3D previz screenshot showing:
+- 3D humanoid mannequins (colored figures representing characters) placed in a 3D scene
+- A background scene (may be a 360 panorama or flat image)
+- The camera angle, character positions, and spatial relationships are already set
+
+Your job:
+1. Preserve the exact spatial layout: character positions, relative distances, camera angle, and composition must match the reference image
+2. Replace the 3D mannequins with photorealistic human characters matching the user's description
+3. Keep the background scene consistent with the reference - same location, same architecture, same time of day
+4. Apply cinematic lighting and color grading appropriate to the scene mood
+5. Render at photorealistic quality: 8K, film grain, natural skin texture, realistic fabric and materials
+6. Do NOT change the camera angle, character positions, or spatial relationships shown in the reference
+
+Output: a single photorealistic cinematic frame that matches the composition of the reference image but with realistic characters, lighting, and atmosphere."""
+
+
+# ============================================================
 # 提示词仓库字典（按 prompt_type 检索）
 # ============================================================
 CANVAS_PROMPTS = {
@@ -749,4 +771,5 @@ CANVAS_PROMPTS = {
     "fission-stage2": PROMPT_FISSION_STAGE2,
     "field-notes": PROMPT_FIELD_NOTES,
     "panorama-gen": PROMPT_PANORAMA_GEN,
+    "director-stage-render": PROMPT_DIRECTOR_STAGE_RENDER,
 }
